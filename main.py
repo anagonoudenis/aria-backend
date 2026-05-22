@@ -172,6 +172,29 @@ async def health_check():
     }
 
 
+@app.get("/health/ip", tags=["Health"])
+async def get_server_ip():
+    """Retourne l'IP publique du serveur — à whitelister sur Binance."""
+    import httpx
+    services = [
+        "https://api.ipify.org?format=json",
+        "https://api64.ipify.org?format=json",
+        "https://ifconfig.me/all.json",
+    ]
+    for url in services:
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(url)
+                data = r.json()
+                ip = data.get("ip") or data.get("ip_addr")
+                if ip:
+                    logger.info(f"Server public IP: {ip}")
+                    return {"server_ip": ip, "action": "Ajoutez cette IP dans Binance > Gestion des clés API > Restrictions IP"}
+        except Exception:
+            continue
+    return {"server_ip": "inconnu", "error": "Impossible de déterminer l'IP publique"}
+
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000,
                 reload=False, log_level="info")
