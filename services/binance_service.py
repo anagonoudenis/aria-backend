@@ -136,6 +136,15 @@ class BinanceService:
                 raise ValueError(
                     f"Calculated quantity {qty} is below minimum {min_qty} for {symbol}"
                 )
+
+            # Vérification min notional (montant minimum par ordre)
+            min_notional = float(info.get("min_notional", "10"))
+            notional = float(qty) * price
+            if notional < min_notional:
+                raise ValueError(
+                    f"Order notional {notional:.2f} USDT < minimum {min_notional:.0f} USDT for {symbol}"
+                )
+
             return float(qty)
         except Exception as e:
             logger.error(f"Error calculating quantity for {symbol}: {e}")
@@ -147,11 +156,15 @@ class BinanceService:
         if quantity <= 0:
             raise ValueError("Quantity must be positive")
 
+        # Formater la quantité sans notation scientifique (ex: 4e-05 → "0.00004")
+        qty_decimal = Decimal(str(quantity))
+        qty_str = f"{qty_decimal:.8f}".rstrip("0").rstrip(".")
+
         try:
             order = self._client.order_market(
                 symbol=symbol,
                 side=side,
-                quantity=quantity,
+                quantity=qty_str,
             )
             logger.info(
                 f"Market order placed: {side} {quantity} {symbol} "
