@@ -6,10 +6,10 @@ logger = get_logger(__name__)
 
 MAX_DRAWDOWN_PCT       = 15.0
 MAX_DAILY_LOSS_PCT     = 5.0
-MIN_CONFIDENCE         = 0.45   # seuil bas pour capturer plus de signaux
-MIN_USDT               = 1.0    # minimum absolu (Binance rejette en dessous de ~$5)
-CIRCUIT_BREAKER_LOSSES = 3
-MAX_ATR_RATIO          = 4.0    # tolérance volatilité augmentée
+MIN_CONFIDENCE         = 0.60   # filtre strict — seulement bons signaux
+MIN_USDT               = 5.50   # au-dessus du min notional Binance ($5)
+CIRCUIT_BREAKER_LOSSES = 5      # 5 pertes consécutives avant pause
+MAX_ATR_RATIO          = 4.0
 KELLY_FRACTION         = 0.25
 
 CORRELATED_PAIRS = [
@@ -67,19 +67,16 @@ class RiskManager:
         risk_pct: float,
         entry_price: float,
         stop_loss_pct: float,
+        max_positions: int = 1,
     ) -> float:
         """
-        Utilise 45% du capital par trade pour pouvoir avoir 2 positions simultanées.
-        Garde toujours au moins 10% de réserve.
+        Taille adaptative : divise le capital par le nombre de positions max.
+        Toujours au-dessus du min notional Binance ($5.50).
         """
-        # 50% par trade — garde 50% libre pour un 2e trade éventuel
-        size = usdt_available * 0.50
-        # Minimum $5.50 pour dépasser le filtre NOTIONAL de Binance ($5 minimum)
-        BINANCE_MIN_NOTIONAL = 5.50
-        size = max(size, BINANCE_MIN_NOTIONAL)
-        # Ne jamais dépasser 95% du capital disponible
-        size = min(size, usdt_available * 0.95)
-        logger.info(f"Position size: {size:.2f} USDT (capital={usdt_available:.2f})")
+        size = (usdt_available / max(max_positions, 1)) * 0.90
+        size = max(size, 5.50)                  # plancher min notional
+        size = min(size, usdt_available * 0.95) # plafond sécurité
+        logger.info(f"Position size: {size:.2f} USDT (capital={usdt_available:.2f}, slots={max_positions})")
         return size
 
     def kelly_position_size(

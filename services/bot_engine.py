@@ -20,20 +20,31 @@ logger = get_logger(__name__)
 INTERVAL_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
 BINANCE_FEE      = 0.001
 
-# Paires scannées à chaque cycle — le bot choisit automatiquement la meilleure
-SCAN_PAIRS = ["BNBUSDT", "SOLUSDT", "ETHUSDT", "BTCUSDT"]
+# 12 paires liquides — min notional $5 sur Binance Spot
+SCAN_PAIRS = [
+    "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT",
+    "DOTUSDT", "LTCUSDT", "TRXUSDT", "LINKUSDT", "AVAXUSDT",
+    "MATICUSDT", "ETHUSDT",
+]
+# Paires nécessitant min notional $10 — exclues si capital < $15
+HIGH_NOTIONAL_PAIRS = {"BTCUSDT", "ETHUSDT"}
 
-# Gestion des positions
-TRAIL_TRIGGER_PCT  = 3.0    # déclencher le trailing TP quand +3%
-TRAIL_STEP_PCT     = 1.5    # trailing step de 1.5%
-BREAKEVEN_PCT      = 2.0    # breakeven quand +2%
-STOP_LOSS_PCT      = 2.0
-TAKE_PROFIT_PCT    = 6.0
+# TP/SL calibrés sur données réelles — ratio 2.5:1
+TRAIL_TRIGGER_PCT  = 1.2
+TRAIL_STEP_PCT     = 0.6
+BREAKEVEN_PCT      = 0.8
+STOP_LOSS_PCT      = 0.8
+TAKE_PROFIT_PCT    = 2.0
 
-# Scalping rapide
-SCALP_CONFIDENCE   = 0.85   # seuil pour scalping 1m
-SCALP_SL_PCT       = 0.5
-SCALP_TP_PCT       = 1.5
+# Scalping haute confiance
+SCALP_CONFIDENCE   = 0.85
+SCALP_SL_PCT       = 0.4
+SCALP_TP_PCT       = 1.0
+
+# Filtres qualité signal — évite les mauvais trades
+MIN_CONFIDENCE       = 0.60
+MIN_COMPOSITE_SCORE  = 15.0
+MAX_CONSECUTIVE_LOSSES = 5
 
 _active_cycles: set = set()
 
@@ -116,32 +127,30 @@ class BotEngine:
         config   = bot_info["config"]
 
         if bot_info.get("circuit_breaker_active"):
-            logger.warning(f"[{user_id}] Circuit breaker — skipping")
+            logger.warning(f"[{user_id}] Circuit breaker actif — cycle ignoré")
             return
 
-        # Déterminer les paires à scanner
-        config_symbol = config.get("symbol", "BNBUSDT")
-        scan_symbols  = list({config_symbol} | set(SCAN_PAIRS))
-
-        logger.info(f"[{user_id}] Cycle start — scanning {len(scan_symbols)} pairs: {scan_symbols}")
-
         # ── 1. Gérer les positions ouvertes AVANT d'ouvrir de nouvelles ─────
-        await self._manage_all_positions(user_id, scan_symbols)
+        all_scan = list(set(SCAN_PAIRS) | {"BTCUSDT"})
+        await self._manage_all_positions(user_id, all_scan)
 
-        # ── 2. Prix courants en parallèle ────────────────────────────────────
-        prices = await self._fetch_prices(scan_symbols)
-
-        # ── 3. Portefeuille ──────────────────────────────────────────────────
+        # ── 2. Portefeuille — source de vérité ───────────────────────────────
         db = get_database()
         portfolio_data = await self._get_portfolio(db, user_id)
+        available_usdt = portfolio_data["available_usdt"]
 
-        if portfolio_data["available_usdt"] < 5.0:
-            logger.info(f"[{user_id}] Capital insuffisant ({portfolio_data['available_usdt']:.2f}) — pas de nouveau trade")
+        logger.info(f"[{user_id}] Cycle start — capital={available_usdt:.2f} USDT")
+
+        if available_usdt < 5.5:
+            logger.info(f"[{user_id}] Capital insuffisant ({available_usdt:.2f}) — pas de nouveau trade")
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # ── 4. Historique (circuit breaker) ──────────────────────────────────
+        # ── 3. Prix courants en parallèle ────────────────────────────────────
+        prices = await self._fetch_prices(all_scan)
+
+        # ── 4. Circuit breaker — arrêt après MAX pertes consécutives ─────────
         recent_trades = await db.trades.find(
             {"user_id": user_id, "status": "CLOSED"}
         ).sort("created_at", -1).limit(50).to_list(50)
@@ -149,8 +158,8 @@ class BotEngine:
         consecutive = risk_manager.count_consecutive_losses(recent_trades)
         bot_info["consecutive_losses"] = consecutive
 
-        if consecutive >= 3:
-            reason = f"Circuit breaker: {consecutive} pertes"
+        if consecutive >= MAX_CONSECUTIVE_LOSSES:
+            reason = f"Circuit breaker: {consecutive} pertes consécutives"
             bot_info["circuit_breaker_active"] = True
             bot_info["circuit_breaker_reason"]  = reason
             await notification_service.send(user_id, "circuit_breaker", {"reason": reason})
@@ -159,26 +168,26 @@ class BotEngine:
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # ── 5. Positions déjà ouvertes ────────────────────────────────────────
+        # ── 5. Positions ouvertes + limite adaptative ─────────────────────────
         open_trades = await db.trades.find(
             {"user_id": user_id, "status": "OPEN"}
         ).to_list(20)
-        open_symbols = {t.get("symbol") for t in open_trades}
-        max_positions = config.get("max_open_trades", 2)
+        open_symbols  = {t.get("symbol") for t in open_trades}
+        max_positions = self._get_max_positions(available_usdt)
 
         if len(open_trades) >= max_positions:
-            logger.info(f"[{user_id}] Max positions atteint ({len(open_trades)}/{max_positions})")
+            logger.info(f"[{user_id}] Max positions ({len(open_trades)}/{max_positions}) — attente")
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # ── 6. SCAN MULTI-PAIRES — cherche la meilleure opportunité ──────────
+        # ── 6. SCAN MULTI-PAIRES — meilleure opportunité ──────────────────────
         best = await self._scan_best_opportunity(
-            user_id, scan_symbols, open_symbols, prices, config, portfolio_data
+            user_id, SCAN_PAIRS, open_symbols, prices, config, portfolio_data
         )
 
         if best is None:
-            logger.info(f"[{user_id}] Scan échoué — pas de données")
+            logger.info(f"[{user_id}] Aucune opportunité ce cycle")
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
@@ -200,12 +209,31 @@ class BotEngine:
             **signal_data, "symbol": symbol, "price": current_price
         })
 
-        # ── 8. Validation + exécution ─────────────────────────────────────────
+        # ── 8. Filtres qualité — seulement les bons signaux ───────────────────
         if signal_data["action"] != "BUY":
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
+        if signal_data["confidence"] < MIN_CONFIDENCE:
+            logger.info(
+                f"[{user_id}] Confiance {signal_data['confidence']:.0%} "
+                f"< {MIN_CONFIDENCE:.0%} — signal ignoré"
+            )
+            bot_info["cycles_count"] += 1
+            bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+            return
+
+        if best["composite_score"] < MIN_COMPOSITE_SCORE:
+            logger.info(
+                f"[{user_id}] Score {best['composite_score']:.1f} "
+                f"< {MIN_COMPOSITE_SCORE} — signal ignoré"
+            )
+            bot_info["cycles_count"] += 1
+            bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+            return
+
+        # ── 9. Validation risk manager ────────────────────────────────────────
         is_valid, reason = risk_manager.validate_trade(
             signal_data, portfolio_data, config,
             len(open_trades), list(open_symbols), consecutive, indicators,
@@ -217,31 +245,28 @@ class BotEngine:
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # ── 9. Déterminer SL/TP selon confiance ──────────────────────────────
+        # ── 10. SL/TP calibrés ───────────────────────────────────────────────
         conf = signal_data["confidence"]
         if conf >= SCALP_CONFIDENCE:
-            # Mode scalping rapide
             sl_pct = SCALP_SL_PCT
             tp_pct = SCALP_TP_PCT
             logger.info(f"[{user_id}] Mode SCALPING ({conf:.0%}): SL={sl_pct}% TP={tp_pct}%")
         else:
-            sl_pct = signal_data.get("suggested_stop_loss_pct",   STOP_LOSS_PCT)
-            tp_pct = signal_data.get("suggested_take_profit_pct", TAKE_PROFIT_PCT)
+            # Clamp dans nos bornes calibrées
+            raw_sl = signal_data.get("suggested_stop_loss_pct",   STOP_LOSS_PCT)
+            raw_tp = signal_data.get("suggested_take_profit_pct", TAKE_PROFIT_PCT)
+            sl_pct = max(min(float(raw_sl), STOP_LOSS_PCT * 1.5),  STOP_LOSS_PCT * 0.5)
+            tp_pct = max(min(float(raw_tp), TAKE_PROFIT_PCT * 1.5), TAKE_PROFIT_PCT * 0.5)
 
-        # Taille de position
-        position_usdt = risk_manager.calculate_position_size(
-            portfolio_data["available_usdt"],
-            config.get("risk_per_trade_pct", 90),
-            current_price, sl_pct,
+        # ── 11. Taille de position adaptative ────────────────────────────────
+        # Divise le capital disponible par le nombre max de positions, utilise 90%
+        position_usdt = (available_usdt / max_positions) * 0.90
+        position_usdt = max(position_usdt, 5.50)             # Min notional Binance
+        position_usdt = min(position_usdt, available_usdt * 0.95)  # Max 95% du capital
+        logger.info(
+            f"[{user_id}] Position: {position_usdt:.2f} USDT "
+            f"(capital={available_usdt:.2f}, slots={max_positions})"
         )
-
-        # Bonus de taille sur signal fort (mais ne dépasse jamais 80% du dispo)
-        if conf >= 0.80:
-            max_allowed = portfolio_data["available_usdt"] * 0.80
-            bonus = min(position_usdt * 0.2, max_allowed - position_usdt)
-            if bonus > 0:
-                position_usdt = min(position_usdt + bonus, max_allowed)
-                logger.info(f"[{user_id}] Bonus taille +20% sur signal fort ({conf:.0%})")
 
         await self._execute_buy(
             user_id, db, symbol, position_usdt, current_price,
@@ -265,31 +290,34 @@ class BotEngine:
     ) -> Optional[Dict[str, Any]]:
         """
         Analyse toutes les paires en parallèle et retourne la meilleure opportunité.
-        Utilise d'abord le score rule-based pour filtrer, puis Claude sur le gagnant.
+        Filtre les paires HIGH_NOTIONAL si capital insuffisant.
+        Utilise toujours des klines 5m pour des signaux stables.
         """
-        interval = config.get("interval", "5m")
+        available = (portfolio_data or {}).get("available_usdt", 0.0)
 
-        # Filtrer les paires déjà en position
-        candidates = [s for s in symbols if s not in open_symbols]
+        # Filtrer : paires déjà en position + HIGH_NOTIONAL si capital < $15
+        candidates = [
+            s for s in symbols
+            if s not in open_symbols
+            and (s not in HIGH_NOTIONAL_PAIRS or available >= 15.0)
+        ]
         if not candidates:
             return None
 
+        # Toujours analyser sur klines 5m — stable et moins de bruit qu'1m
+        analysis_interval = "5m"
+
         # Phase 1 : score rule-based rapide sur toutes les paires (parallèle)
-        tasks = [self._analyze_pair_fast(s, interval) for s in candidates]
+        tasks = [self._analyze_pair_fast(s, analysis_interval) for s in candidates]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         scored = []
         for sym, result in zip(candidates, results):
-            if isinstance(result, Exception):
-                logger.debug(f"Scan {sym} error: {result}")
-                continue
-            if result is None:
+            if isinstance(result, Exception) or result is None:
                 continue
             indicators, rule_sig = result
             score  = rule_sig.get("score", 0)
             action = rule_sig.get("action", "HOLD")
-            # Pré-filtre très léger : score >= 1 suffit pour passer à Claude
-            # On laisse Claude décider si c'est vraiment une opportunité
             scored.append({
                 "symbol": sym, "score": score, "action": action,
                 "indicators": indicators, "rule_sig": rule_sig,
@@ -298,33 +326,23 @@ class BotEngine:
         if not scored:
             return None
 
-        # Trier par score décroissant — prendre le meilleur TOUJOURS
-        # On envoie toujours le meilleur candidat à Claude même si HOLD
-        # Claude peut changer HOLD → BUY si les conditions globales sont bonnes
-
-        # Phase 2 : trier et prendre le meilleur, appeler Claude dessus
+        # Phase 2 : meilleur candidat → validation Claude
         scored.sort(key=lambda x: x["score"], reverse=True)
         best_candidate = scored[0]
-        sym       = best_candidate["symbol"]
-        indicators= best_candidate["indicators"]
-        rule_sig  = best_candidate["rule_sig"]
-        price     = prices.get(sym, 0)
-
-        # Utilise le portfolio déjà fetché — évite un 2e appel Binance
-        pf = portfolio_data or {}
+        sym        = best_candidate["symbol"]
+        indicators = best_candidate["indicators"]
+        rule_sig   = best_candidate["rule_sig"]
+        price      = prices.get(sym, 0)
+        pf         = portfolio_data or {}
 
         try:
-            signal_data = await claude_service.analyze_market(
-                sym, indicators, price, pf
-            )
+            signal_data = await claude_service.analyze_market(sym, indicators, price, pf)
         except Exception as e:
             logger.warning(f"Claude failed for {sym}: {e} — using rule-based")
-            signal_data = claude_service._from_rule_signal(rule_sig, indicators)
+            signal_data = claude_service._from_rule(rule_sig, indicators)
 
-        # Score composite : confiance × score
         composite = signal_data["confidence"] * 10 + best_candidate["score"]
 
-        # Toujours retourner le meilleur signal — run_cycle décide quoi faire
         return {
             "symbol":          sym,
             "signal":          signal_data,
@@ -741,6 +759,14 @@ class BotEngine:
             await db.portfolio_history.insert_one(snap.to_mongo())
         except Exception as e:
             logger.error(f"Portfolio update error {user_id}: {e}")
+
+    @staticmethod
+    def _get_max_positions(available_usdt: float) -> int:
+        """Nombre max de positions simultanées selon le capital disponible."""
+        if available_usdt < 15.0:  return 1
+        if available_usdt < 25.0:  return 2
+        if available_usdt < 50.0:  return 3
+        return 4
 
     async def _broadcast(self, user_id: str, message_type: str, data: Dict[str, Any]) -> None:
         from routers.websocket import send_update
