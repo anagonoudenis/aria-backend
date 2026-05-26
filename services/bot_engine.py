@@ -245,18 +245,15 @@ class BotEngine:
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # ── 10. SL/TP calibrés ───────────────────────────────────────────────
+        # ── 10. SL/TP calibrés — valeurs fixes, on ignore la suggestion Claude ──
         conf = signal_data["confidence"]
         if conf >= SCALP_CONFIDENCE:
             sl_pct = SCALP_SL_PCT
             tp_pct = SCALP_TP_PCT
             logger.info(f"[{user_id}] Mode SCALPING ({conf:.0%}): SL={sl_pct}% TP={tp_pct}%")
         else:
-            # Clamp dans nos bornes calibrées
-            raw_sl = signal_data.get("suggested_stop_loss_pct",   STOP_LOSS_PCT)
-            raw_tp = signal_data.get("suggested_take_profit_pct", TAKE_PROFIT_PCT)
-            sl_pct = max(min(float(raw_sl), STOP_LOSS_PCT * 1.5),  STOP_LOSS_PCT * 0.5)
-            tp_pct = max(min(float(raw_tp), TAKE_PROFIT_PCT * 1.5), TAKE_PROFIT_PCT * 0.5)
+            sl_pct = STOP_LOSS_PCT    # 0.8% — calibré sur donnees reelles
+            tp_pct = TAKE_PROFIT_PCT  # 2.0% — ratio 2.5:1 garanti
 
         # ── 11. Taille de position adaptative ────────────────────────────────
         # Divise le capital disponible par le nombre max de positions, utilise 90%
