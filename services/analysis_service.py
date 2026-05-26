@@ -65,6 +65,7 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         indicators["momentum"] = {
             "rsi":       _f(df["rsi"].iloc[-1]),
             "rsi_prev":  _f(df["rsi"].iloc[-2]) if len(df) > 2 else _f(df["rsi"].iloc[-1]),
+            "rsi_3ago":  _f(df["rsi"].iloc[-4]) if len(df) > 4 else _f(df["rsi"].iloc[-1]),
             "stoch_k":   _f(df["stoch_k"].iloc[-1]),
             "stoch_d":   _f(df["stoch_d"].iloc[-1]),
             "williams_r":_f(df["williams_r"].iloc[-1]),
@@ -147,13 +148,12 @@ def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
 
 def generate_momentum_signal(indicators: Dict[str, Any], df: pd.DataFrame) -> Dict[str, Any]:
     """
-    Stratégie Momentum Scalper 5m.
-    Basée sur la convergence de 5 facteurs techniques.
-    Expectation positive dès 55% win rate avec ratio 1:2.
+    Stratégie Momentum Scalper 5m — v2 avec filtres ADX, volume directionnel, RSI confirmé.
     """
     try:
         rsi      = indicators.get("momentum", {}).get("rsi", 50)
         rsi_prev = indicators.get("momentum", {}).get("rsi_prev", 50)
+        rsi_3ago = indicators.get("momentum", {}).get("rsi_3ago", rsi_prev)
         macd_h   = indicators.get("trend", {}).get("macd_histogram", 0)
         macd_l   = indicators.get("trend", {}).get("macd_line", 0)
         macd_s   = indicators.get("trend", {}).get("macd_signal", 0)
@@ -169,11 +169,16 @@ def generate_momentum_signal(indicators: Dict[str, Any], df: pd.DataFrame) -> Di
 
         candles = indicators.get("candles_summary", [])
         close   = candles[-1]["close"] if candles else 0
+        last_open = candles[-1]["open"] if candles else close
+        last_candle_bull = close > last_open  # bougie haussière
 
         # ── Volatilité excessive → neutre ────────────────────────────────────
         if atr_r > 4.0:
             return {"action": "HOLD", "confidence": 0.25, "score": 0,
                     "momentum_score": 0, "reason": "Volatilite anormale"}
+
+        # ADX < 20 → marché en range, indicateurs de tendance peu fiables
+        trending = adx >= 20
 
         # ── Score BUY — convergence momentum haussier ────────────────────────
         buy_pts = []
@@ -184,19 +189,24 @@ def generate_momentum_signal(indicators: Dict[str, Any], df: pd.DataFrame) -> Di
         elif rsi < 48:      buy_pts.append(("RSI neutre bas", 2))
         elif rsi < 55:      buy_pts.append(("RSI leger achat", 1))
 
-        # RSI en remontée (divergence haussière)
-        if rsi > rsi_prev + 1:  buy_pts.append(("RSI en remontee", 1))
+        # RSI en remontée confirmée sur 2 bougies (plus fiable qu'une seule)
+        rsi_rising_confirmed = rsi > rsi_prev + 0.5 and rsi_prev > rsi_3ago + 0.5
+        if rsi_rising_confirmed:
+            buy_pts.append(("RSI remontee confirmee 2 bougies", 2))
+        elif rsi > rsi_prev + 1:
+            buy_pts.append(("RSI en remontee", 1))
 
-        # MACD
-        if macd_h > 0:          buy_pts.append(("MACD positif", 2))
-        if macd_l > macd_s:     buy_pts.append(("MACD croissement", 1))
+        # MACD — seulement si marché en tendance (ADX >= 20)
+        if trending:
+            if macd_h > 0:      buy_pts.append(("MACD positif", 2))
+            if macd_l > macd_s: buy_pts.append(("MACD croissement", 1))
 
         # EMA structure
-        if close > ema9:        buy_pts.append(("Prix>EMA9", 1))
-        if ema9 > ema21:        buy_pts.append(("EMA9>EMA21", 1))
+        if close > ema9:    buy_pts.append(("Prix>EMA9", 1))
+        if trending and ema9 > ema21: buy_pts.append(("EMA9>EMA21", 1))
 
-        # Volume
-        if vol_r > 1.15:        buy_pts.append(("Volume confirme", 1))
+        # Volume directionnel — ne compte que si la bougie est haussière
+        if vol_r > 1.15 and last_candle_bull: buy_pts.append(("Volume haussier", 1))
         if cmf > 0:             buy_pts.append(("CMF positif", 1))
         if obv_sl > 0:          buy_pts.append(("OBV haussier", 1))
 
@@ -216,20 +226,25 @@ def generate_momentum_signal(indicators: Dict[str, Any], df: pd.DataFrame) -> Di
         # ── Score SELL ────────────────────────────────────────────────────────
         sell_pts = []
 
-        if rsi > 78:            sell_pts.append(("RSI tres suracheté", 4))
-        elif rsi > 68:          sell_pts.append(("RSI suracheté", 3))
+        if rsi > 78:            sell_pts.append(("RSI tres surachete", 4))
+        elif rsi > 68:          sell_pts.append(("RSI surachete", 3))
         elif rsi > 60:          sell_pts.append(("RSI neutre haut", 2))
         elif rsi > 55:          sell_pts.append(("RSI leger vente", 1))
 
-        if rsi < rsi_prev - 1: sell_pts.append(("RSI en baisse", 1))
+        rsi_falling_confirmed = rsi < rsi_prev - 0.5 and rsi_prev < rsi_3ago - 0.5
+        if rsi_falling_confirmed:
+            sell_pts.append(("RSI baisse confirmee 2 bougies", 2))
+        elif rsi < rsi_prev - 1:
+            sell_pts.append(("RSI en baisse", 1))
 
-        if macd_h < 0:          sell_pts.append(("MACD negatif", 2))
-        if macd_l < macd_s:     sell_pts.append(("MACD negatif croissement", 1))
+        if trending:
+            if macd_h < 0:      sell_pts.append(("MACD negatif", 2))
+            if macd_l < macd_s: sell_pts.append(("MACD negatif croissement", 1))
 
         if close < ema9:        sell_pts.append(("Prix<EMA9", 1))
-        if ema9 < ema21:        sell_pts.append(("EMA9<EMA21", 1))
+        if trending and ema9 < ema21: sell_pts.append(("EMA9<EMA21", 1))
 
-        if vol_r > 1.15:        sell_pts.append(("Volume confirme", 1))
+        if vol_r > 1.15 and not last_candle_bull: sell_pts.append(("Volume baissier", 1))
         if cmf < 0:             sell_pts.append(("CMF negatif", 1))
         if obv_sl < 0:          sell_pts.append(("OBV baissier", 1))
 
@@ -257,6 +272,7 @@ def generate_momentum_signal(indicators: Dict[str, Any], df: pd.DataFrame) -> Di
                 "momentum_score": buy_score - sell_score,
                 "reason":         "BUY score=" + str(buy_score) + " " + ", ".join(reasons),
                 "buy_factors":    buy_pts,
+                "adx_trending":   trending,
             }
 
         elif sell_score >= THRESHOLD and sell_score > buy_score:
@@ -269,10 +285,10 @@ def generate_momentum_signal(indicators: Dict[str, Any], df: pd.DataFrame) -> Di
                 "momentum_score": sell_score - buy_score,
                 "reason":         "SELL score=" + str(sell_score) + " " + ", ".join(reasons),
                 "sell_factors":   sell_pts,
+                "adx_trending":   trending,
             }
 
         else:
-            # HOLD — retourner le momentum net pour le classement relatif
             net = buy_score - sell_score
             return {
                 "action":         "HOLD",
@@ -280,6 +296,7 @@ def generate_momentum_signal(indicators: Dict[str, Any], df: pd.DataFrame) -> Di
                 "score":          max(buy_score, sell_score),
                 "momentum_score": net,
                 "reason":         "HOLD BUY=" + str(buy_score) + " SELL=" + str(sell_score),
+                "adx_trending":   trending,
             }
 
     except Exception as e:

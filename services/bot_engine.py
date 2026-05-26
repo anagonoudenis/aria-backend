@@ -42,9 +42,10 @@ SCALP_SL_PCT       = 0.4
 SCALP_TP_PCT       = 1.0
 
 # Filtres qualité signal — évite les mauvais trades
-MIN_CONFIDENCE       = 0.60
-MIN_COMPOSITE_SCORE  = 15.0
+MIN_CONFIDENCE       = 0.65
+MIN_COMPOSITE_SCORE  = 20.0
 MAX_CONSECUTIVE_LOSSES = 5
+SL_COOLDOWN_SECONDS  = 45 * 60  # 45 min cooldown par paire après SL
 
 _active_cycles: set = set()
 
@@ -73,7 +74,8 @@ class BotEngine:
             "consecutive_losses": 0,
             "circuit_breaker_active": False,
             "circuit_breaker_reason": None,
-            "scan_results": {},  # dernier scan multi-paires
+            "scan_results": {},
+            "sl_cooldown": {},  # {symbol: datetime} — paires en cooldown après SL
         }
 
         db = get_database()
@@ -287,37 +289,66 @@ class BotEngine:
     ) -> Optional[Dict[str, Any]]:
         """
         Analyse toutes les paires en parallèle et retourne la meilleure opportunité.
-        Filtre les paires HIGH_NOTIONAL si capital insuffisant.
-        Utilise toujours des klines 5m pour des signaux stables.
+        Filtre : HIGH_NOTIONAL si capital < $15, cooldown SL, tendance EMA, confluence MTF.
         """
         available = (portfolio_data or {}).get("available_usdt", 0.0)
 
-        # Filtrer : paires déjà en position + HIGH_NOTIONAL si capital < $15
+        # Cooldown : paires ayant récemment déclenché un SL
+        now = datetime.now(timezone.utc)
+        sl_cooldown = self._running_bots.get(user_id, {}).get("sl_cooldown", {})
         candidates = [
             s for s in symbols
             if s not in open_symbols
             and (s not in HIGH_NOTIONAL_PAIRS or available >= 15.0)
+            and (
+                s not in sl_cooldown
+                or (now - sl_cooldown[s]).total_seconds() > SL_COOLDOWN_SECONDS
+            )
         ]
         if not candidates:
             return None
 
-        # Toujours analyser sur klines 5m — stable et moins de bruit qu'1m
-        analysis_interval = "5m"
-
-        # Phase 1 : score rule-based rapide sur toutes les paires (parallèle)
-        tasks = [self._analyze_pair_fast(s, analysis_interval) for s in candidates]
+        # Phase 1 : analyse 5m + 15m en parallèle sur toutes les paires
+        tasks = [self._analyze_pair_fast(s) for s in candidates]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         scored = []
         for sym, result in zip(candidates, results):
             if isinstance(result, Exception) or result is None:
                 continue
-            indicators, rule_sig = result
-            score  = rule_sig.get("score", 0)
-            action = rule_sig.get("action", "HOLD")
+            indicators_5m, rule_sig_5m, rule_sig_15m = result
+
+            action_5m  = rule_sig_5m.get("action", "HOLD")
+            action_15m = rule_sig_15m.get("action", "HOLD")
+            score_5m   = rule_sig_5m.get("score", 0)
+
+            # Filtre tendance : pour un BUY, EMA9 > EMA21 ET close > EMA21
+            if action_5m == "BUY":
+                trend  = indicators_5m.get("trend", {})
+                candles = indicators_5m.get("candles_summary", [])
+                close  = candles[-1]["close"] if candles else 0
+                ema9   = trend.get("ema_9", 0)
+                ema21  = trend.get("ema_21", 0)
+                if not (ema9 > ema21 and close > ema21):
+                    logger.debug(f"{sym}: filtre tendance EMA — ema9={ema9:.4f} ema21={ema21:.4f} close={close:.4f}")
+                    continue
+
+            # Confluence MTF : 5m BUY + 15m SELL = contradiction → ignorer
+            if action_5m == "BUY" and action_15m == "SELL":
+                logger.debug(f"{sym}: contradiction MTF (5m=BUY, 15m=SELL) — ignore")
+                continue
+            if action_5m == "SELL" and action_15m == "BUY":
+                logger.debug(f"{sym}: contradiction MTF (5m=SELL, 15m=BUY) — ignore")
+                continue
+
+            # Bonus si les deux timeframes sont alignés BUY
+            confluence_mult = 1.3 if (action_5m == "BUY" and action_15m == "BUY") else 1.0
+            score = round(score_5m * confluence_mult, 1)
+
             scored.append({
-                "symbol": sym, "score": score, "action": action,
-                "indicators": indicators, "rule_sig": rule_sig,
+                "symbol": sym, "score": score, "action": action_5m,
+                "indicators": indicators_5m, "rule_sig": rule_sig_5m,
+                "confluence_15m": action_15m,
             })
 
         if not scored:
@@ -331,6 +362,11 @@ class BotEngine:
         rule_sig   = best_candidate["rule_sig"]
         price      = prices.get(sym, 0)
         pf         = portfolio_data or {}
+
+        logger.info(
+            f"[{user_id}] Meilleur candidat: {sym} score={best_candidate['score']:.1f} "
+            f"5m={best_candidate['action']} 15m={best_candidate['confluence_15m']}"
+        )
 
         try:
             signal_data = await claude_service.analyze_market(sym, indicators, price, pf)
@@ -348,26 +384,50 @@ class BotEngine:
         }
 
     async def _analyze_pair_fast(
-        self, symbol: str, interval: str
-    ) -> Optional[Tuple[Dict, Dict]]:
-        """Analyse rapide d'une paire : klines + indicateurs + rule-based."""
+        self, symbol: str
+    ) -> Optional[Tuple[Dict, Dict, Dict]]:
+        """Analyse rapide : klines 5m + 15m, indicateurs, rule-based. Retourne (ind_5m, sig_5m, sig_15m)."""
         try:
-            kline_key = f"klines:{symbol}:{interval}"
-            df = cache.get(kline_key)
-            if df is None:
-                df = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: binance_service.get_klines(symbol, interval, limit=100)
+            # ── 5m ───────────────────────────────────────────────────────────
+            key_5m = f"klines:{symbol}:5m"
+            df_5m = cache.get(key_5m)
+            if df_5m is None:
+                df_5m = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: binance_service.get_klines(symbol, "5m", limit=100)
                 )
-                cache.set(kline_key, df, ttl_seconds=KLINE_TTL.get(interval, 300))
+                cache.set(key_5m, df_5m, ttl_seconds=KLINE_TTL.get("5m", 300))
 
-            ind_key = f"indicators:{symbol}:{interval}"
-            indicators = cache.get(ind_key)
-            if indicators is None:
-                indicators = analysis_service.compute_indicators(df)
-                cache.set(ind_key, indicators, ttl_seconds=INDICATOR_TTL.get(interval, 300))
+            ind_key_5m = f"indicators:{symbol}:5m"
+            ind_5m = cache.get(ind_key_5m)
+            if ind_5m is None:
+                ind_5m = analysis_service.compute_indicators(df_5m)
+                cache.set(ind_key_5m, ind_5m, ttl_seconds=INDICATOR_TTL.get("5m", 300))
 
-            rule_sig = indicators.get("rule_signal", {})
-            return indicators, rule_sig
+            rule_5m = ind_5m.get("rule_signal", {})
+
+            # ── 15m ──────────────────────────────────────────────────────────
+            rule_15m: Dict = {}
+            try:
+                key_15m = f"klines:{symbol}:15m"
+                df_15m = cache.get(key_15m)
+                if df_15m is None:
+                    df_15m = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: binance_service.get_klines(symbol, "15m", limit=100)
+                    )
+                    cache.set(key_15m, df_15m, ttl_seconds=KLINE_TTL.get("15m", 900))
+
+                ind_key_15m = f"indicators:{symbol}:15m"
+                ind_15m = cache.get(ind_key_15m)
+                if ind_15m is None:
+                    ind_15m = analysis_service.compute_indicators(df_15m)
+                    cache.set(ind_key_15m, ind_15m, ttl_seconds=INDICATOR_TTL.get("15m", 900))
+
+                rule_15m = ind_15m.get("rule_signal", {})
+            except Exception as e15:
+                logger.debug(f"15m analysis {symbol} failed (non bloquant): {e15}")
+
+            return ind_5m, rule_5m, rule_15m
+
         except Exception as e:
             logger.debug(f"Fast analysis {symbol} failed: {e}")
             return None
@@ -618,6 +678,13 @@ class BotEngine:
             bot_info["consecutive_losses"] = (
                 bot_info.get("consecutive_losses", 0) + 1 if pnl < 0 else 0
             )
+
+            # Cooldown 45 min sur la paire après un SL
+            if reason == "stop_loss":
+                if "sl_cooldown" not in bot_info:
+                    bot_info["sl_cooldown"] = {}
+                bot_info["sl_cooldown"][symbol] = datetime.now(timezone.utc)
+                logger.info(f"[{user_id}] Cooldown 45min sur {symbol} apres stop_loss")
 
             await self._update_portfolio(db, user_id)
 
