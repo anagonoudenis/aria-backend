@@ -220,7 +220,7 @@ class BotEngine:
         if signal_data["confidence"] < MIN_CONFIDENCE:
             logger.info(
                 f"[{user_id}] Confiance {signal_data['confidence']:.0%} "
-                f"< {MIN_CONFIDENCE:.0%} — signal ignoré"
+                f"< {MIN_CONFIDENCE:.0%} — signal ignore"
             )
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
@@ -229,11 +229,41 @@ class BotEngine:
         if best["composite_score"] < MIN_COMPOSITE_SCORE:
             logger.info(
                 f"[{user_id}] Score {best['composite_score']:.1f} "
-                f"< {MIN_COMPOSITE_SCORE} — signal ignoré"
+                f"< {MIN_COMPOSITE_SCORE} — signal ignore"
             )
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
+
+        # ── 8b. Filtre régime de marché — refuse les mauvaises conditions ────
+        market_regime   = signal_data.get("market_regime", "RANGING")
+        tf_alignment    = signal_data.get("timeframe_alignment", "MODERATE")
+
+        # Jamais acheter en tendance baissière confirmée
+        if market_regime == "TRENDING_DOWN":
+            logger.info(f"[{user_id}] Regime TRENDING_DOWN — trade refuse")
+            bot_info["cycles_count"] += 1
+            bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+            return
+
+        # Jamais acheter avec signal faible
+        if tf_alignment == "WEAK":
+            logger.info(f"[{user_id}] Alignement WEAK — trade refuse")
+            bot_info["cycles_count"] += 1
+            bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+            return
+
+        # En marché volatile ou en range : exiger un score plus élevé
+        if market_regime in ("VOLATILE", "RANGING"):
+            required_score = MIN_COMPOSITE_SCORE * 1.25  # +25% de seuil
+            if best["composite_score"] < required_score:
+                logger.info(
+                    f"[{user_id}] Regime {market_regime}: score {best['composite_score']:.1f} "
+                    f"< {required_score:.1f} — trade refuse"
+                )
+                bot_info["cycles_count"] += 1
+                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+                return
 
         # ── 9. Validation risk manager ────────────────────────────────────────
         is_valid, reason = risk_manager.validate_trade(
