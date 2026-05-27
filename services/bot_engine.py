@@ -1,6 +1,6 @@
 import asyncio
 from typing import Dict, Any, Optional, List, Tuple
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from bson import ObjectId
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -75,7 +75,8 @@ class BotEngine:
             "circuit_breaker_active": False,
             "circuit_breaker_reason": None,
             "scan_results": {},
-            "sl_cooldown": {},  # {symbol: datetime} — paires en cooldown après SL
+            "sl_cooldown": {},       # {symbol: datetime} — paires en cooldown après SL
+            "pending_entry": None,   # signal en attente d'un pullback vers EMA9
         }
 
         db = get_database()
@@ -129,7 +130,13 @@ class BotEngine:
         config   = bot_info["config"]
 
         if bot_info.get("circuit_breaker_active"):
-            logger.warning(f"[{user_id}] Circuit breaker actif — cycle ignoré")
+            logger.warning(f"[{user_id}] Circuit breaker actif — cycle ignore")
+            return
+
+        # ── 0. Filtre horaire — pas de trade entre 1h et 7h UTC ─────────────
+        utc_hour = datetime.now(timezone.utc).hour
+        if 1 <= utc_hour < 7:
+            logger.info(f"[{user_id}] Heure creuse ({utc_hour}h UTC) — cycle skip")
             return
 
         # ── 1. Gérer les positions ouvertes AVANT d'ouvrir de nouvelles ─────
@@ -152,6 +159,13 @@ class BotEngine:
         # ── 3. Prix courants en parallèle ────────────────────────────────────
         prices = await self._fetch_prices(all_scan)
 
+        # ── 3b. Vérifier entrée en attente (pullback) ─────────────────────────
+        executed_pending = await self._check_pending_entries(user_id, prices, db, portfolio_data)
+        if executed_pending:
+            bot_info["cycles_count"] += 1
+            bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+            return
+
         # ── 4. Circuit breaker — arrêt après MAX pertes consécutives ─────────
         recent_trades = await db.trades.find(
             {"user_id": user_id, "status": "CLOSED"}
@@ -169,6 +183,15 @@ class BotEngine:
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
+
+        # ── 4b. Filtre BTC macro — pas de BUY si BTC en tendance baissière ──────
+        btc_ok, btc_reason = await self._check_btc_macro()
+        if not btc_ok:
+            logger.info(f"[{user_id}] Filtre BTC: {btc_reason}")
+            bot_info["cycles_count"] += 1
+            bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+            return
+        logger.info(f"[{user_id}] BTC macro OK — {btc_reason}")
 
         # ── 5. Positions ouvertes + limite adaptative ─────────────────────────
         open_trades = await db.trades.find(
@@ -277,33 +300,193 @@ class BotEngine:
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # ── 10. SL/TP calibrés — valeurs fixes, on ignore la suggestion Claude ──
+        # ── 10. SL/TP dynamiques basés sur ATR — ratio 2:1 garanti ──────────
         conf = signal_data["confidence"]
         if conf >= SCALP_CONFIDENCE:
             sl_pct = SCALP_SL_PCT
             tp_pct = SCALP_TP_PCT
             logger.info(f"[{user_id}] Mode SCALPING ({conf:.0%}): SL={sl_pct}% TP={tp_pct}%")
         else:
-            sl_pct = STOP_LOSS_PCT    # 0.8% — calibré sur donnees reelles
-            tp_pct = TAKE_PROFIT_PCT  # 2.0% — ratio 2.5:1 garanti
+            atr = indicators.get("volatility", {}).get("atr", 0)
+            if atr > 0 and current_price > 0:
+                raw_sl = (1.2 * atr / current_price) * 100
+                raw_tp = (2.5 * atr / current_price) * 100
+                # Bornes de securite : SL [0.5% — 1.5%], TP [1.5% — 4.0%]
+                sl_pct = round(max(min(raw_sl, 1.5), 0.5), 3)
+                tp_pct = round(max(min(raw_tp, 4.0), 1.5), 3)
+                logger.info(
+                    f"[{user_id}] ATR={atr:.4f} SL={sl_pct}% TP={tp_pct}% "
+                    f"ratio={tp_pct/sl_pct:.1f}:1"
+                )
+            else:
+                sl_pct = STOP_LOSS_PCT
+                tp_pct = TAKE_PROFIT_PCT
+                logger.info(f"[{user_id}] ATR indisponible — SL={sl_pct}% TP={tp_pct}% (defaut)")
 
         # ── 11. Taille de position adaptative ────────────────────────────────
-        # Divise le capital disponible par le nombre max de positions, utilise 90%
         position_usdt = (available_usdt / max_positions) * 0.90
-        position_usdt = max(position_usdt, 5.50)             # Min notional Binance
-        position_usdt = min(position_usdt, available_usdt * 0.95)  # Max 95% du capital
+        position_usdt = max(position_usdt, 5.50)
+        position_usdt = min(position_usdt, available_usdt * 0.95)
         logger.info(
             f"[{user_id}] Position: {position_usdt:.2f} USDT "
             f"(capital={available_usdt:.2f}, slots={max_positions})"
         )
 
-        await self._execute_buy(
-            user_id, db, symbol, position_usdt, current_price,
-            sl_pct, tp_pct, signal_data, portfolio_data, config
-        )
+        # ── 12. Pullback entry — attendre EMA9 si prix trop haut ─────────────
+        ema9 = indicators.get("trend", {}).get("ema_9", 0)
+        if ema9 > 0 and current_price > ema9 * 1.003:
+            # Prix > EMA9 + 0.3% → attendre un pullback vers EMA9
+            bot_info["pending_entry"] = {
+                "symbol":        symbol,
+                "target_entry":  round(ema9, 8),
+                "signal_data":   signal_data,
+                "indicators":    indicators,
+                "sl_pct":        sl_pct,
+                "tp_pct":        tp_pct,
+                "config":        config,
+                "created_at":    datetime.now(timezone.utc),
+                "expires_at":    datetime.now(timezone.utc) + timedelta(minutes=5),
+            }
+            logger.info(
+                f"[{user_id}] Pullback pending {symbol}: "
+                f"prix={current_price:.4f} > EMA9={ema9:.4f} — attente retour"
+            )
+        else:
+            # Prix deja proche ou sous EMA9 → entree immediate
+            await self._execute_buy(
+                user_id, db, symbol, position_usdt, current_price,
+                sl_pct, tp_pct, signal_data, portfolio_data, config
+            )
 
         bot_info["cycles_count"] += 1
         bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # FILTRE BTC MACRO
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _check_btc_macro(self) -> Tuple[bool, str]:
+        """
+        Vérifie la direction macro de BTC sur 15m.
+        Conditions pour trader :
+          - BTC close > EMA21 (tendance court terme haussière)
+          - EMA21 > SMA50  (structure de tendance confirmée)
+        Retourne (can_trade: bool, reason: str).
+        """
+        try:
+            key_df = "klines:BTCUSDT:15m"
+            df = cache.get(key_df)
+            if df is None:
+                df = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: binance_service.get_klines("BTCUSDT", "15m", limit=100)
+                )
+                cache.set(key_df, df, ttl_seconds=KLINE_TTL.get("15m", 900))
+
+            key_ind = "indicators:BTCUSDT:15m"
+            ind = cache.get(key_ind)
+            if ind is None:
+                ind = analysis_service.compute_indicators(df)
+                cache.set(key_ind, ind, ttl_seconds=INDICATOR_TTL.get("15m", 900))
+
+            trend   = ind.get("trend", {})
+            candles = ind.get("candles_summary", [])
+            btc_close = candles[-1]["close"] if candles else 0
+            ema21     = trend.get("ema_21", 0)
+            sma50     = trend.get("sma_50", 0)
+
+            if btc_close <= 0 or ema21 <= 0:
+                return True, "donnees BTC indisponibles — trade autorise par defaut"
+
+            if btc_close < ema21:
+                return False, f"BTC {btc_close:.0f} < EMA21 {ema21:.0f} — marche baissier"
+
+            if sma50 > 0 and ema21 < sma50:
+                return False, f"BTC EMA21 {ema21:.0f} < SMA50 {sma50:.0f} — structure baissiere"
+
+            return True, f"BTC {btc_close:.0f} > EMA21 {ema21:.0f} — marche haussier"
+
+        except Exception as e:
+            logger.warning(f"BTC macro check failed: {e} — trade autorise par defaut")
+            return True, "erreur BTC check — autorise par defaut"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PULLBACK ENTRY — ENTRÉE SUR RETOUR EMA9
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _check_pending_entries(
+        self,
+        user_id: str,
+        prices: Dict[str, float],
+        db,
+        portfolio_data: Dict[str, Any],
+    ) -> bool:
+        """
+        Vérifie si une entrée en attente (pullback) peut être exécutée.
+        Retourne True si un trade a été exécuté, False sinon.
+        """
+        bot_info = self._running_bots.get(user_id, {})
+        pending  = bot_info.get("pending_entry")
+        if not pending:
+            return False
+
+        symbol     = pending["symbol"]
+        target     = pending["target_entry"]
+        expires_at = pending["expires_at"]
+        now        = datetime.now(timezone.utc)
+
+        # Expiré — annuler
+        if now > expires_at:
+            logger.info(f"[{user_id}] Pending entry {symbol} expire — annule")
+            bot_info["pending_entry"] = None
+            return False
+
+        # Paire désormais en position ouverte — annuler
+        open_syms = {
+            t.get("symbol") for t in
+            await db.trades.find({"user_id": user_id, "status": "OPEN"}).to_list(20)
+        }
+        if symbol in open_syms:
+            logger.info(f"[{user_id}] Pending entry {symbol} annule — position deja ouverte")
+            bot_info["pending_entry"] = None
+            return False
+
+        current_price = prices.get(symbol, 0)
+        if current_price <= 0:
+            return False
+
+        # Prix revenu à la cible EMA9 (tolérance 0.2%)
+        if current_price <= target * 1.002:
+            available_usdt = portfolio_data.get("available_usdt", 0.0)
+            if available_usdt < 5.5:
+                logger.info(f"[{user_id}] Pending entry {symbol} — capital insuffisant ({available_usdt:.2f})")
+                bot_info["pending_entry"] = None
+                return False
+
+            max_positions = self._get_max_positions(available_usdt)
+            position_usdt = (available_usdt / max_positions) * 0.90
+            position_usdt = max(position_usdt, 5.50)
+            position_usdt = min(position_usdt, available_usdt * 0.95)
+
+            logger.info(
+                f"[{user_id}] Pullback atteint {symbol}: "
+                f"prix={current_price:.4f} <= cible={target:.4f} — execution"
+            )
+
+            config = pending["config"]
+            await self._execute_buy(
+                user_id, db, symbol, position_usdt, current_price,
+                pending["sl_pct"], pending["tp_pct"],
+                pending["signal_data"], portfolio_data, config,
+            )
+            bot_info["pending_entry"] = None
+            return True
+
+        remaining = int((expires_at - now).total_seconds())
+        logger.info(
+            f"[{user_id}] Pending {symbol}: prix={current_price:.4f} "
+            f"cible={target:.4f} — attente ({remaining}s restants)"
+        )
+        return False
 
     # ══════════════════════════════════════════════════════════════════════════
     # SCAN MULTI-PAIRES
