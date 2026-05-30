@@ -86,7 +86,10 @@ class BotEngine:
         logger.info(f"Bot started: user={user_id} interval={interval} scanning={SCAN_PAIRS}")
         asyncio.create_task(self._bot_loop(user_id, interval_seconds))
         if len(self._running_bots) == 1:
-            await websocket_feed.start(list(set(SCAN_PAIRS + ["BTCUSDT"])))
+            try:
+                await websocket_feed.start(list(set(SCAN_PAIRS + ["BTCUSDT"])))
+            except Exception as ws_err:
+                logger.warning(f"WS feed start failed (non-bloquant): {ws_err}")
 
     async def _bot_loop(self, user_id: str, interval_seconds: int) -> None:
         logger.info(f"[{user_id}] Loop started ({interval_seconds}s)")
