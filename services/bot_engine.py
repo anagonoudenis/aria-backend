@@ -14,8 +14,6 @@ from models.trade import TradeInDB, TradeSide, TradeStatus
 from models.portfolio import PortfolioSnapshot
 from utils.cache import cache, KLINE_TTL, INDICATOR_TTL, PRICE_TTL
 from utils.logger import get_logger
-from services import websocket_feed
-from services.market_data_service import get_order_book_imbalance
 
 logger = get_logger(__name__)
 
@@ -85,11 +83,6 @@ class BotEngine:
         await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"bot_config.is_running": True}})
         logger.info(f"Bot started: user={user_id} interval={interval} scanning={SCAN_PAIRS}")
         asyncio.create_task(self._bot_loop(user_id, interval_seconds))
-        if len(self._running_bots) == 1:
-            try:
-                await websocket_feed.start(list(set(SCAN_PAIRS + ["BTCUSDT"])))
-            except Exception as ws_err:
-                logger.warning(f"WS feed start failed (non-bloquant): {ws_err}")
 
     async def _bot_loop(self, user_id: str, interval_seconds: int) -> None:
         logger.info(f"[{user_id}] Loop started ({interval_seconds}s) — waiting 15s before first cycle")
@@ -108,8 +101,6 @@ class BotEngine:
         db = get_database()
         await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"bot_config.is_running": False}})
         logger.info(f"Bot stopped: {user_id} ({reason})")
-        if not self._running_bots:
-            await websocket_feed.stop()
 
     def is_running(self, user_id: str) -> bool:
         return user_id in self._running_bots
@@ -633,23 +624,8 @@ class BotEngine:
             + (" [TRIPLE BULL]" if best.get("triple_bull") else "")
         )
 
-        # Phase 2b : Order Book Imbalance check
-        order_book = None
-        try:
-            order_book = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: get_order_book_imbalance(sym)
-            )
-            ob_signal = order_book.get("imbalance_signal", "NEUTRAL")
-            ob_score  = order_book.get("imbalance_score", 0.0)
-            ob_ratio  = order_book.get("bid_ask_ratio", 1.0)
-            logger.info(f"[{user_id}] OB {sym}: ratio={ob_ratio:.2f} {ob_signal} ({ob_score:.0%})")
-            if ob_signal == "SELL" and ob_score > 0.5:
-                logger.info(f"[{user_id}] OB strong SELL pressure on {sym} — skip")
-                return None
-        except Exception as obe:
-            logger.debug(f"OB check {sym} failed: {obe}")
-
         # Phase 3 : Claude Sonnet final validation
+        order_book = None
         try:
             signal_data = await claude_service.analyze_market_final(
                 sym, indicators, price, pf,
@@ -1013,38 +989,23 @@ class BotEngine:
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _fetch_prices(self, symbols: List[str]) -> Dict[str, float]:
-        """Fetch prices — WebSocket cache first, REST fallback."""
-        prices: Dict[str, float] = {}
-        to_fetch: List[str] = []
+        """Fetch tous les prix en parallèle via REST avec cache."""
+        async def _get(sym):
+            key = f"price:{sym}"
+            p   = cache.get(key)
+            if p:
+                return sym, p
+            try:
+                p = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: binance_service.get_current_price(sym)
+                )
+                cache.set(key, p, ttl_seconds=PRICE_TTL)
+                return sym, p
+            except Exception:
+                return sym, 0.0
 
-        for sym in symbols:
-            ws_price = websocket_feed.get_cached_price(sym)
-            if ws_price and ws_price > 0:
-                prices[sym] = ws_price
-            else:
-                to_fetch.append(sym)
-
-        if to_fetch:
-            async def _get(sym):
-                key = f"price:{sym}"
-                p   = cache.get(key)
-                if p:
-                    return sym, p
-                try:
-                    p = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: binance_service.get_current_price(sym)
-                    )
-                    cache.set(key, p, ttl_seconds=PRICE_TTL)
-                    return sym, p
-                except Exception:
-                    return sym, 0.0
-
-            rest = await asyncio.gather(*[_get(s) for s in to_fetch])
-            for sym, p in rest:
-                if p > 0:
-                    prices[sym] = p
-
-        return prices
+        results = await asyncio.gather(*[_get(s) for s in symbols])
+        return {sym: price for sym, price in results if price > 0}
 
     async def _save_signal(
         self, db, user_id: str, symbol: str,
