@@ -92,7 +92,8 @@ class BotEngine:
                 logger.warning(f"WS feed start failed (non-bloquant): {ws_err}")
 
     async def _bot_loop(self, user_id: str, interval_seconds: int) -> None:
-        logger.info(f"[{user_id}] Loop started ({interval_seconds}s)")
+        logger.info(f"[{user_id}] Loop started ({interval_seconds}s) — waiting 15s before first cycle")
+        await asyncio.sleep(15)  # let Railway healthcheck pass before first Binance calls
         await self._run_cycle_safe(user_id)
         while self.is_running(user_id):
             await asyncio.sleep(interval_seconds)

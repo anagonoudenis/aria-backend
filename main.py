@@ -170,13 +170,7 @@ async def root():
 
 @app.get("/health", tags=["Health"])
 async def health_check():
-    from utils.cache import cache
-    from services.bot_engine import bot_engine
-    return {
-        "status": "healthy", "version": "2.0.0",
-        "active_bots": len(bot_engine._running_bots),
-        "cache": cache.stats(),
-    }
+    return {"status": "healthy", "version": "2.0.0"}
 
 
 @app.get("/health/ip", tags=["Health"])

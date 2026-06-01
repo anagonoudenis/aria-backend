@@ -11,11 +11,14 @@ logger = get_logger(__name__)
 
 class BinanceService:
     def __init__(self):
+        # 10s timeout on all requests — prevents hanging indefinitely when IP not whitelisted
+        _req_params = {"timeout": 10}
         if settings.BINANCE_TESTNET:
             self._client = Client(
                 api_key=settings.BINANCE_API_KEY,
                 api_secret=settings.BINANCE_SECRET_KEY,
                 testnet=True,
+                requests_params=_req_params,
             )
             logger.info("Binance client initialised — TESTNET mode")
         else:
@@ -23,6 +26,7 @@ class BinanceService:
                 api_key=settings.BINANCE_API_KEY,
                 api_secret=settings.BINANCE_SECRET_KEY,
                 testnet=False,
+                requests_params=_req_params,
             )
             logger.info("Binance client initialised — LIVE mode")
 
