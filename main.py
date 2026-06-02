@@ -33,8 +33,6 @@ app.add_middleware(
 
 if settings.ENVIRONMENT == "production":
     allowed_hosts = [h.replace("https://", "").replace("http://", "").split("/")[0] for h in cors_origins]
-    # Add localhost and wildcard so Railway's internal healthcheck is never blocked
-    allowed_hosts += ["localhost", "127.0.0.1", "*.railway.app", "*"]
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
 
 
@@ -163,14 +161,15 @@ app.include_router(backtest.router,  prefix=PREFIX)
 app.include_router(websocket.router, prefix=PREFIX)
 
 
-@app.get("/", tags=["Health"])
-async def root():
-    return {"status": "ok", "service": "ARIA Trading Bot API"}
-
-
 @app.get("/health", tags=["Health"])
 async def health_check():
-    return {"status": "healthy", "version": "2.0.0"}
+    from utils.cache import cache
+    from services.bot_engine import bot_engine
+    return {
+        "status": "healthy", "version": "2.0.0",
+        "active_bots": len(bot_engine._running_bots),
+        "cache": cache.stats(),
+    }
 
 
 @app.get("/health/ip", tags=["Health"])

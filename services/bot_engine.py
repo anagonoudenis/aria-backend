@@ -85,8 +85,7 @@ class BotEngine:
         asyncio.create_task(self._bot_loop(user_id, interval_seconds))
 
     async def _bot_loop(self, user_id: str, interval_seconds: int) -> None:
-        logger.info(f"[{user_id}] Loop started ({interval_seconds}s) — waiting 15s before first cycle")
-        await asyncio.sleep(15)  # let Railway healthcheck pass before first Binance calls
+        logger.info(f"[{user_id}] Loop started ({interval_seconds}s)")
         await self._run_cycle_safe(user_id)
         while self.is_running(user_id):
             await asyncio.sleep(interval_seconds)
@@ -187,7 +186,6 @@ class BotEngine:
 
         # ── 4b. Filtre BTC macro — pas de BUY si BTC en tendance baissière ──────
         btc_ok, btc_reason = await self._check_btc_macro()
-        bot_info["btc_context"] = btc_reason  # pass to Sonnet final validation
         if not btc_ok:
             logger.info(f"[{user_id}] Filtre BTC: {btc_reason}")
             bot_info["cycles_count"] += 1
@@ -210,7 +208,7 @@ class BotEngine:
 
         # ── 6. SCAN MULTI-PAIRES — meilleure opportunité ──────────────────────
         best = await self._scan_best_opportunity(
-            user_id, SCAN_PAIRS, open_symbols, prices, config, portfolio_data, btc_reason
+            user_id, SCAN_PAIRS, open_symbols, prices, config, portfolio_data
         )
 
         if best is None:
@@ -325,24 +323,13 @@ class BotEngine:
                 tp_pct = TAKE_PROFIT_PCT
                 logger.info(f"[{user_id}] ATR indisponible — SL={sl_pct}% TP={tp_pct}% (defaut)")
 
-        # ── 11. Kelly position sizing ─────────────────────────────────────────
-        base_usdt    = (available_usdt / max_positions) * 0.90
-        win_rate_pct = portfolio_data.get("win_rate", 0)
-        kelly_mult   = 1.0
-        if win_rate_pct > 0:
-            win_r    = win_rate_pct / 100
-            rr_ratio = tp_pct / sl_pct if sl_pct > 0 else 2.5
-            kelly    = win_r - (1 - win_r) / rr_ratio
-            # Half-Kelly, bounded: [0.7x, 1.5x] base sizing
-            kelly_mult   = 1.0 + max(min(kelly * 0.5, 0.5), -0.3)
-            position_usdt = base_usdt * kelly_mult
-        else:
-            position_usdt = base_usdt
+        # ── 11. Taille de position adaptative ────────────────────────────────
+        position_usdt = (available_usdt / max_positions) * 0.90
         position_usdt = max(position_usdt, 5.50)
         position_usdt = min(position_usdt, available_usdt * 0.95)
         logger.info(
             f"[{user_id}] Position: {position_usdt:.2f} USDT "
-            f"(capital={available_usdt:.2f} WR={win_rate_pct:.0f}% kelly_mult={kelly_mult:.2f})"
+            f"(capital={available_usdt:.2f}, slots={max_positions})"
         )
 
         # ── 12. Pullback entry — attendre EMA9 si prix trop haut ─────────────
@@ -368,8 +355,7 @@ class BotEngine:
             # Prix deja proche ou sous EMA9 → entree immediate
             await self._execute_buy(
                 user_id, db, symbol, position_usdt, current_price,
-                sl_pct, tp_pct, signal_data, portfolio_data, config,
-                indicators=indicators,
+                sl_pct, tp_pct, signal_data, portfolio_data, config
             )
 
         bot_info["cycles_count"] += 1
@@ -491,7 +477,6 @@ class BotEngine:
                 user_id, db, symbol, position_usdt, current_price,
                 pending["sl_pct"], pending["tp_pct"],
                 pending["signal_data"], portfolio_data, config,
-                indicators=pending.get("indicators"),
             )
             bot_info["pending_entry"] = None
             return True
@@ -514,14 +499,14 @@ class BotEngine:
         prices: Dict[str, float],
         config: Dict[str, Any],
         portfolio_data: Optional[Dict[str, Any]] = None,
-        btc_context: str = "",
     ) -> Optional[Dict[str, Any]]:
         """
-        Triple timeframe scan (5m+15m+1h) + Order Book + Sonnet final validation.
-        Filters: HIGH_NOTIONAL cap, SL cooldown, EMA trend, MTF confluence, OB pressure.
+        Analyse toutes les paires en parallèle et retourne la meilleure opportunité.
+        Filtre : HIGH_NOTIONAL si capital < $15, cooldown SL, tendance EMA, confluence MTF.
         """
         available = (portfolio_data or {}).get("available_usdt", 0.0)
 
+        # Cooldown : paires ayant récemment déclenché un SL
         now = datetime.now(timezone.utc)
         sl_cooldown = self._running_bots.get(user_id, {}).get("sl_cooldown", {})
         candidates = [
@@ -536,108 +521,73 @@ class BotEngine:
         if not candidates:
             return None
 
-        # Phase 1 : triple timeframe analysis en parallèle
-        tasks   = [self._analyze_pair_fast(s) for s in candidates]
+        # Phase 1 : analyse 5m + 15m en parallèle sur toutes les paires
+        tasks = [self._analyze_pair_fast(s) for s in candidates]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         scored = []
         for sym, result in zip(candidates, results):
             if isinstance(result, Exception) or result is None:
                 continue
+            indicators_5m, rule_sig_5m, rule_sig_15m = result
 
-            ind_5m   = result["ind_5m"]
-            rule_5m  = result["rule_5m"]
-            rule_15m = result["rule_15m"]
-            ind_1h   = result.get("ind_1h", {})
-            rule_1h  = result.get("rule_1h", {})
+            action_5m  = rule_sig_5m.get("action", "HOLD")
+            action_15m = rule_sig_15m.get("action", "HOLD")
+            score_5m   = rule_sig_5m.get("score", 0)
 
-            action_5m  = rule_5m.get("action", "HOLD")
-            action_15m = rule_15m.get("action", "HOLD")
-            action_1h  = rule_1h.get("action", "HOLD")
-            score_5m   = rule_5m.get("score", 0)
-
-            # EMA trend filter for BUY
+            # Filtre tendance : pour un BUY, EMA9 > EMA21 ET close > EMA21
             if action_5m == "BUY":
-                trend   = ind_5m.get("trend", {})
-                candles = ind_5m.get("candles_summary", [])
-                close   = candles[-1]["close"] if candles else 0
-                ema9    = trend.get("ema_9", 0)
-                ema21   = trend.get("ema_21", 0)
+                trend  = indicators_5m.get("trend", {})
+                candles = indicators_5m.get("candles_summary", [])
+                close  = candles[-1]["close"] if candles else 0
+                ema9   = trend.get("ema_9", 0)
+                ema21  = trend.get("ema_21", 0)
                 if not (ema9 > ema21 and close > ema21):
-                    logger.debug(f"{sym}: EMA filter failed ema9={ema9:.4f} ema21={ema21:.4f}")
+                    logger.debug(f"{sym}: filtre tendance EMA — ema9={ema9:.4f} ema21={ema21:.4f} close={close:.4f}")
                     continue
 
-            # 5m vs 15m contradiction
+            # Confluence MTF : 5m BUY + 15m SELL = contradiction → ignorer
             if action_5m == "BUY" and action_15m == "SELL":
-                logger.debug(f"{sym}: 5m/15m contradiction BUY/SELL")
+                logger.debug(f"{sym}: contradiction MTF (5m=BUY, 15m=SELL) — ignore")
                 continue
             if action_5m == "SELL" and action_15m == "BUY":
-                logger.debug(f"{sym}: 5m/15m contradiction SELL/BUY")
+                logger.debug(f"{sym}: contradiction MTF (5m=SELL, 15m=BUY) — ignore")
                 continue
 
-            # 1h contradiction — 5m BUY but 1h SELL → skip
-            if action_5m == "BUY" and action_1h == "SELL":
-                logger.debug(f"{sym}: 1h SELL contradicts 5m BUY — skip")
-                continue
-
-            # Confluence multiplier: triple > double > single
-            triple_bull = (action_5m == "BUY" and action_15m == "BUY" and action_1h == "BUY")
-            double_bull = (action_5m == "BUY" and action_15m == "BUY")
-
-            if triple_bull:
-                confluence_mult = 1.5
-            elif double_bull:
-                confluence_mult = 1.3
-            else:
-                confluence_mult = 1.0
-
+            # Bonus si les deux timeframes sont alignés BUY
+            confluence_mult = 1.3 if (action_5m == "BUY" and action_15m == "BUY") else 1.0
             score = round(score_5m * confluence_mult, 1)
 
             scored.append({
-                "symbol":        sym,
-                "score":         score,
-                "action":        action_5m,
-                "indicators":    ind_5m,
-                "rule_sig":      rule_5m,
+                "symbol": sym, "score": score, "action": action_5m,
+                "indicators": indicators_5m, "rule_sig": rule_sig_5m,
                 "confluence_15m": action_15m,
-                "confluence_1h": action_1h,
-                "ind_1h":        ind_1h,
-                "triple_bull":   triple_bull,
             })
 
         if not scored:
             return None
 
-        # Phase 2 : best candidate
+        # Phase 2 : meilleur candidat → validation Claude
         scored.sort(key=lambda x: x["score"], reverse=True)
-        best   = scored[0]
-        sym    = best["symbol"]
-        indicators = best["indicators"]
-        rule_sig   = best["rule_sig"]
-        ind_1h     = best.get("ind_1h") or {}
+        best_candidate = scored[0]
+        sym        = best_candidate["symbol"]
+        indicators = best_candidate["indicators"]
+        rule_sig   = best_candidate["rule_sig"]
         price      = prices.get(sym, 0)
         pf         = portfolio_data or {}
 
         logger.info(
-            f"[{user_id}] Best: {sym} score={best['score']:.1f} "
-            f"5m={best['action']} 15m={best['confluence_15m']} 1h={best['confluence_1h']}"
-            + (" [TRIPLE BULL]" if best.get("triple_bull") else "")
+            f"[{user_id}] Meilleur candidat: {sym} score={best_candidate['score']:.1f} "
+            f"5m={best_candidate['action']} 15m={best_candidate['confluence_15m']}"
         )
 
-        # Phase 3 : Claude Sonnet final validation
-        order_book = None
         try:
-            signal_data = await claude_service.analyze_market_final(
-                sym, indicators, price, pf,
-                order_book=order_book,
-                ind_1h=ind_1h if ind_1h else None,
-                btc_context=btc_context,
-            )
+            signal_data = await claude_service.analyze_market(sym, indicators, price, pf)
         except Exception as e:
-            logger.warning(f"Sonnet failed for {sym}: {e} — using rule-based")
+            logger.warning(f"Claude failed for {sym}: {e} — using rule-based")
             signal_data = claude_service._from_rule(rule_sig, indicators)
 
-        composite = signal_data["confidence"] * 10 + best["score"]
+        composite = signal_data["confidence"] * 10 + best_candidate["score"]
 
         return {
             "symbol":          sym,
@@ -646,12 +596,14 @@ class BotEngine:
             "composite_score": composite,
         }
 
-    async def _analyze_pair_fast(self, symbol: str) -> Optional[Dict]:
-        """Triple timeframe analysis: 5m + 15m + 1h. Returns dict with all data."""
+    async def _analyze_pair_fast(
+        self, symbol: str
+    ) -> Optional[Tuple[Dict, Dict, Dict]]:
+        """Analyse rapide : klines 5m + 15m, indicateurs, rule-based. Retourne (ind_5m, sig_5m, sig_15m)."""
         try:
             # ── 5m ───────────────────────────────────────────────────────────
             key_5m = f"klines:{symbol}:5m"
-            df_5m  = cache.get(key_5m)
+            df_5m = cache.get(key_5m)
             if df_5m is None:
                 df_5m = await asyncio.get_event_loop().run_in_executor(
                     None, lambda: binance_service.get_klines(symbol, "5m", limit=100)
@@ -670,7 +622,7 @@ class BotEngine:
             rule_15m: Dict = {}
             try:
                 key_15m = f"klines:{symbol}:15m"
-                df_15m  = cache.get(key_15m)
+                df_15m = cache.get(key_15m)
                 if df_15m is None:
                     df_15m = await asyncio.get_event_loop().run_in_executor(
                         None, lambda: binance_service.get_klines(symbol, "15m", limit=100)
@@ -685,35 +637,9 @@ class BotEngine:
 
                 rule_15m = ind_15m.get("rule_signal", {})
             except Exception as e15:
-                logger.debug(f"15m {symbol} failed (non bloquant): {e15}")
+                logger.debug(f"15m analysis {symbol} failed (non bloquant): {e15}")
 
-            # ── 1h ───────────────────────────────────────────────────────────
-            ind_1h: Dict = {}
-            rule_1h: Dict = {}
-            try:
-                key_1h = f"klines:{symbol}:1h"
-                df_1h  = cache.get(key_1h)
-                if df_1h is None:
-                    df_1h = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: binance_service.get_klines(symbol, "1h", limit=100)
-                    )
-                    cache.set(key_1h, df_1h, ttl_seconds=KLINE_TTL.get("1h", 3600))
-
-                ind_key_1h = f"indicators:{symbol}:1h"
-                ind_1h = cache.get(ind_key_1h)
-                if ind_1h is None:
-                    ind_1h = analysis_service.compute_indicators(df_1h)
-                    cache.set(ind_key_1h, ind_1h, ttl_seconds=INDICATOR_TTL.get("1h", 3600))
-
-                rule_1h = ind_1h.get("rule_signal", {})
-            except Exception as e1h:
-                logger.debug(f"1h {symbol} failed (non bloquant): {e1h}")
-
-            return {
-                "ind_5m":  ind_5m,  "rule_5m":  rule_5m,
-                "rule_15m": rule_15m,
-                "ind_1h":  ind_1h,  "rule_1h":  rule_1h,
-            }
+            return ind_5m, rule_5m, rule_15m
 
         except Exception as e:
             logger.debug(f"Fast analysis {symbol} failed: {e}")
@@ -760,10 +686,6 @@ class BotEngine:
 
         pnl_pct = (price - entry) / entry * 100
 
-        # Dynamic trail step: tighter when ADX > 30 (strong trend — lock profits faster)
-        adx_at_entry = float(trade.get("signal_adx", 0) or 0)
-        trail_step   = 0.3 if adx_at_entry > 30 else TRAIL_STEP_PCT
-
         # Mettre à jour le plus haut
         updates = {}
         if price > highest:
@@ -775,17 +697,17 @@ class BotEngine:
             new_sl = entry * 1.001
             updates["stop_loss_price"] = new_sl
             sl_price = new_sl
-            logger.info(f"[{user_id}] Breakeven {trade['symbol']}: SL -> ${new_sl:.4f}")
+            logger.info(f"[{user_id}] Breakeven {trade['symbol']}: SL → ${new_sl:.4f}")
 
-        # ── TRAILING TAKE-PROFIT : le TP suit le prix après TRAIL_TRIGGER_PCT ─
+        # ── TRAILING TAKE-PROFIT : quand +3%, le TP suit le prix ─────────────
         if pnl_pct >= TRAIL_TRIGGER_PCT:
-            new_trailing_tp = price * (1 + trail_step / 100)
+            new_trailing_tp = price * (1 + TRAIL_STEP_PCT / 100)
             if new_trailing_tp > trailing_tp:
                 updates["trailing_tp_price"] = new_trailing_tp
                 trailing_tp = new_trailing_tp
                 logger.info(
                     f"[{user_id}] Trailing TP {trade['symbol']}: "
-                    f"+{pnl_pct:.1f}% -> TP ${new_trailing_tp:.4f} (step={trail_step}%)"
+                    f"+{pnl_pct:.1f}% → TP monté à ${new_trailing_tp:.4f}"
                 )
 
         if updates:
@@ -823,7 +745,6 @@ class BotEngine:
         symbol: str, position_usdt: float, current_price: float,
         sl_pct: float, tp_pct: float,
         signal_data: Dict, portfolio_data: Dict, config: Dict,
-        indicators: Optional[Dict] = None,
     ) -> None:
         """Place un ordre BUY et sauvegarde le trade."""
         try:
@@ -862,7 +783,6 @@ class BotEngine:
             "trailing_tp_active":  False,
             "signal_confidence":   signal_data["confidence"],
             "signal_source":       signal_data.get("source", "claude"),
-            "signal_adx":          (indicators or {}).get("trend", {}).get("adx", 0),
         })
 
         trade_id = None
@@ -989,12 +909,11 @@ class BotEngine:
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _fetch_prices(self, symbols: List[str]) -> Dict[str, float]:
-        """Fetch tous les prix en parallèle via REST avec cache."""
+        """Fetch tous les prix en parallèle."""
         async def _get(sym):
             key = f"price:{sym}"
             p   = cache.get(key)
-            if p:
-                return sym, p
+            if p: return sym, p
             try:
                 p = await asyncio.get_event_loop().run_in_executor(
                     None, lambda: binance_service.get_current_price(sym)
