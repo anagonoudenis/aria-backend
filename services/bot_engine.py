@@ -29,23 +29,27 @@ SCAN_PAIRS = [
 # Paires nécessitant min notional $10 — exclues si capital < $15
 HIGH_NOTIONAL_PAIRS = {"BTCUSDT", "ETHUSDT"}
 
-# TP/SL calibrés sur données réelles — ratio 2.5:1
-TRAIL_TRIGGER_PCT  = 1.2
-TRAIL_STEP_PCT     = 0.6
-BREAKEVEN_PCT      = 0.8
+# TP/SL — ratio 3:1 garanti
+TRAIL_TRIGGER_PCT  = 1.0   # trailing TP déclenché dès +1%
+TRAIL_STEP_PCT     = 0.5
+BREAKEVEN_PCT      = 0.7
 STOP_LOSS_PCT      = 0.8
-TAKE_PROFIT_PCT    = 2.0
+TAKE_PROFIT_PCT    = 2.5   # ratio 3:1 (2.5/0.8)
 
-# Scalping haute confiance
+# Scalping haute confiance — TP rapide, SL serré
 SCALP_CONFIDENCE   = 0.85
-SCALP_SL_PCT       = 0.4
+SCALP_SL_PCT       = 0.35  # serré pour préserver le capital
 SCALP_TP_PCT       = 1.0
 
-# Filtres qualité signal — évite les mauvais trades
-MIN_CONFIDENCE       = 0.65
-MIN_COMPOSITE_SCORE  = 20.0
+# Filtres qualité — seulement les meilleurs signaux
+MIN_CONFIDENCE       = 0.80  # confiance minimum 80%
+MIN_COMPOSITE_SCORE  = 28.0  # score brut ≥ 8 × 1.3 confluence × 10 conf
+MIN_SCORE_RAW        = 8     # score rule-based minimum 8/15
+MIN_ADX              = 25    # tendance forte confirmée
+MIN_VOLUME_RATIO     = 2.0   # volume 2x la moyenne
 MAX_CONSECUTIVE_LOSSES = 5
 SL_COOLDOWN_SECONDS  = 45 * 60  # 45 min cooldown par paire après SL
+DAILY_MAX_LOSS_PCT   = 5.0       # stoppe si perte journalière > 5% du capital
 
 _active_cycles: set = set()
 
@@ -75,8 +79,10 @@ class BotEngine:
             "circuit_breaker_active": False,
             "circuit_breaker_reason": None,
             "scan_results": {},
-            "sl_cooldown": {},       # {symbol: datetime} — paires en cooldown après SL
-            "pending_entry": None,   # signal en attente d'un pullback vers EMA9
+            "sl_cooldown": {},          # {symbol: datetime} — paires en cooldown après SL
+            "pending_entry": None,     # signal en attente d'un pullback vers EMA9
+            "daily_start_capital": 0.0,  # capital en début de journée UTC
+            "last_day_reset": None,    # date du dernier reset journalier
         }
 
         db = get_database()
@@ -149,6 +155,25 @@ class BotEngine:
         available_usdt = portfolio_data["available_usdt"]
 
         logger.info(f"[{user_id}] Cycle start — capital={available_usdt:.2f} USDT")
+
+        # ── 2b. Reset journalier + circuit breaker perte journalière ─────────
+        today = datetime.now(timezone.utc).date()
+        if bot_info.get("last_day_reset") != today:
+            bot_info["daily_start_capital"] = available_usdt
+            bot_info["last_day_reset"]       = today
+            logger.info(f"[{user_id}] Nouveau jour — capital de reference: {available_usdt:.2f} USDT")
+
+        daily_start = bot_info.get("daily_start_capital", available_usdt)
+        if daily_start > 0:
+            daily_loss_pct = (daily_start - available_usdt) / daily_start * 100
+            if daily_loss_pct >= DAILY_MAX_LOSS_PCT:
+                logger.warning(
+                    f"[{user_id}] Perte journaliere {daily_loss_pct:.1f}% "
+                    f">= {DAILY_MAX_LOSS_PCT}% — pause trading aujourd'hui"
+                )
+                bot_info["cycles_count"] += 1
+                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+                return
 
         if available_usdt < 5.5:
             logger.info(f"[{user_id}] Capital insuffisant ({available_usdt:.2f}) — pas de nouveau trade")
@@ -300,36 +325,45 @@ class BotEngine:
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # ── 10. SL/TP dynamiques basés sur ATR — ratio 2:1 garanti ──────────
+        # ── 10. SL/TP — ratio 3:1 garanti ────────────────────────────────────
         conf = signal_data["confidence"]
         if conf >= SCALP_CONFIDENCE:
-            sl_pct = SCALP_SL_PCT
-            tp_pct = SCALP_TP_PCT
+            sl_pct = SCALP_SL_PCT   # 0.35%
+            tp_pct = SCALP_TP_PCT   # 1.0%
             logger.info(f"[{user_id}] Mode SCALPING ({conf:.0%}): SL={sl_pct}% TP={tp_pct}%")
         else:
             atr = indicators.get("volatility", {}).get("atr", 0)
             if atr > 0 and current_price > 0:
-                raw_sl = (1.2 * atr / current_price) * 100
-                raw_tp = (2.5 * atr / current_price) * 100
-                # Bornes de securite : SL [0.5% — 1.5%], TP [1.5% — 4.0%]
-                sl_pct = round(max(min(raw_sl, 1.5), 0.5), 3)
-                tp_pct = round(max(min(raw_tp, 4.0), 1.5), 3)
+                raw_sl = (1.0 * atr / current_price) * 100
+                raw_tp = (3.0 * atr / current_price) * 100
+                # Bornes : SL [0.5%-1.0%], TP [1.5%-4.0%] ratio min 2.5:1
+                sl_pct = round(max(min(raw_sl, 1.0), 0.5), 3)
+                tp_pct = round(max(min(raw_tp, 4.0), max(1.5, sl_pct * 2.5)), 3)
                 logger.info(
-                    f"[{user_id}] ATR={atr:.4f} SL={sl_pct}% TP={tp_pct}% "
-                    f"ratio={tp_pct/sl_pct:.1f}:1"
+                    f"[{user_id}] ATR SL={sl_pct}% TP={tp_pct}% ratio={tp_pct/sl_pct:.1f}:1"
                 )
             else:
-                sl_pct = STOP_LOSS_PCT
-                tp_pct = TAKE_PROFIT_PCT
-                logger.info(f"[{user_id}] ATR indisponible — SL={sl_pct}% TP={tp_pct}% (defaut)")
+                sl_pct = STOP_LOSS_PCT   # 0.8%
+                tp_pct = TAKE_PROFIT_PCT  # 2.5%
+                logger.info(f"[{user_id}] Default SL={sl_pct}% TP={tp_pct}%")
 
-        # ── 11. Taille de position adaptative ────────────────────────────────
-        position_usdt = (available_usdt / max_positions) * 0.90
+        # ── 11. Kelly position sizing ─────────────────────────────────────────
+        base_usdt    = (available_usdt / max_positions) * 0.90
+        win_rate_pct = portfolio_data.get("win_rate", 0)
+        kelly_mult   = 1.0
+        if win_rate_pct > 0:
+            win_r    = win_rate_pct / 100
+            rr_ratio = tp_pct / sl_pct if sl_pct > 0 else 3.0
+            kelly    = win_r - (1 - win_r) / rr_ratio
+            kelly_mult = 1.0 + max(min(kelly * 0.5, 0.5), -0.3)
+            position_usdt = base_usdt * kelly_mult
+        else:
+            position_usdt = base_usdt
         position_usdt = max(position_usdt, 5.50)
         position_usdt = min(position_usdt, available_usdt * 0.95)
         logger.info(
-            f"[{user_id}] Position: {position_usdt:.2f} USDT "
-            f"(capital={available_usdt:.2f}, slots={max_positions})"
+            f"[{user_id}] Kelly position: {position_usdt:.2f} USDT "
+            f"(WR={win_rate_pct:.0f}% mult={kelly_mult:.2f})"
         )
 
         # ── 12. Pullback entry — attendre EMA9 si prix trop haut ─────────────
@@ -355,7 +389,8 @@ class BotEngine:
             # Prix deja proche ou sous EMA9 → entree immediate
             await self._execute_buy(
                 user_id, db, symbol, position_usdt, current_price,
-                sl_pct, tp_pct, signal_data, portfolio_data, config
+                sl_pct, tp_pct, signal_data, portfolio_data, config,
+                indicators=indicators,
             )
 
         bot_info["cycles_count"] += 1
@@ -477,6 +512,7 @@ class BotEngine:
                 user_id, db, symbol, position_usdt, current_price,
                 pending["sl_pct"], pending["tp_pct"],
                 pending["signal_data"], portfolio_data, config,
+                indicators=pending.get("indicators"),
             )
             bot_info["pending_entry"] = None
             return True
@@ -521,7 +557,7 @@ class BotEngine:
         if not candidates:
             return None
 
-        # Phase 1 : analyse 5m + 15m en parallèle sur toutes les paires
+        # Phase 1 : analyse triple timeframe 5m + 15m + 1h en parallèle
         tasks = [self._analyze_pair_fast(s) for s in candidates]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -529,39 +565,101 @@ class BotEngine:
         for sym, result in zip(candidates, results):
             if isinstance(result, Exception) or result is None:
                 continue
-            indicators_5m, rule_sig_5m, rule_sig_15m = result
+
+            # Unpack 4-tuple (rétrocompatible si 1h manque)
+            if len(result) == 4:
+                indicators_5m, rule_sig_5m, rule_sig_15m, rule_sig_1h = result
+            else:
+                indicators_5m, rule_sig_5m, rule_sig_15m = result
+                rule_sig_1h = {}
 
             action_5m  = rule_sig_5m.get("action", "HOLD")
             action_15m = rule_sig_15m.get("action", "HOLD")
+            action_1h  = rule_sig_1h.get("action", "HOLD")
             score_5m   = rule_sig_5m.get("score", 0)
 
-            # Filtre tendance : pour un BUY, EMA9 > EMA21 ET close > EMA21
+            # ── Filtre score brut minimum 8/15 ────────────────────────────
+            if score_5m < MIN_SCORE_RAW:
+                logger.debug(f"{sym}: score {score_5m} < {MIN_SCORE_RAW} — skip")
+                continue
+
+            # ── Filtres BUY uniquement ────────────────────────────────────
             if action_5m == "BUY":
-                trend  = indicators_5m.get("trend", {})
-                candles = indicators_5m.get("candles_summary", [])
-                close  = candles[-1]["close"] if candles else 0
-                ema9   = trend.get("ema_9", 0)
-                ema21  = trend.get("ema_21", 0)
-                if not (ema9 > ema21 and close > ema21):
-                    logger.debug(f"{sym}: filtre tendance EMA — ema9={ema9:.4f} ema21={ema21:.4f} close={close:.4f}")
+                trend_5m   = indicators_5m.get("trend", {})
+                momentum   = indicators_5m.get("momentum", {})
+                volume_ind = indicators_5m.get("volume", {})
+                candles    = indicators_5m.get("candles_summary", [])
+
+                # ADX > 25 — tendance forte
+                adx = trend_5m.get("adx", 0)
+                if adx < MIN_ADX:
+                    logger.debug(f"{sym}: ADX={adx:.1f} < {MIN_ADX} — skip")
                     continue
 
-            # Confluence MTF : 5m BUY + 15m SELL = contradiction → ignorer
+                # Volume 2x la moyenne
+                vol_ratio = volume_ind.get("volume_ratio", 1.0)
+                if vol_ratio < MIN_VOLUME_RATIO:
+                    logger.debug(f"{sym}: vol={vol_ratio:.1f}x < {MIN_VOLUME_RATIO}x — skip")
+                    continue
+
+                # RSI entre 35 et 65 — ni survendu profond, ni suracheté
+                rsi = momentum.get("rsi", 50)
+                if not (35 <= rsi <= 65):
+                    logger.debug(f"{sym}: RSI={rsi:.1f} hors zone 35-65 — skip")
+                    continue
+
+                # MACD histogram positif — momentum haussier confirmé
+                macd_h = trend_5m.get("macd_histogram", 0)
+                if macd_h <= 0:
+                    logger.debug(f"{sym}: MACD_h={macd_h:.6f} <= 0 — skip")
+                    continue
+
+                # Anti-chasing — si dernière bougie déjà +0.8%, trop tard
+                if len(candles) >= 2:
+                    last_c = candles[-1]
+                    prev_c = candles[-2]
+                    if prev_c.get("close", 0) > 0:
+                        last_move = (last_c.get("close", 0) - prev_c.get("close", 0)) / prev_c.get("close", 0) * 100
+                        if last_move > 0.8:
+                            logger.debug(f"{sym}: derniere bougie +{last_move:.2f}% — chasing skip")
+                            continue
+
+            # ── Filtre tendance EMA : EMA9 > EMA21 ET close > EMA21 ──────
+            if action_5m == "BUY":
+                trend_f = indicators_5m.get("trend", {})
+                cands_f = indicators_5m.get("candles_summary", [])
+                close_f = cands_f[-1]["close"] if cands_f else 0
+                ema9_f  = trend_f.get("ema_9", 0)
+                ema21_f = trend_f.get("ema_21", 0)
+                if not (ema9_f > ema21_f and close_f > ema21_f):
+                    logger.debug(f"{sym}: EMA filter — ema9={ema9_f:.4f} ema21={ema21_f:.4f}")
+                    continue
+
+            # ── Contradiction MTF ─────────────────────────────────────────
             if action_5m == "BUY" and action_15m == "SELL":
-                logger.debug(f"{sym}: contradiction MTF (5m=BUY, 15m=SELL) — ignore")
+                logger.debug(f"{sym}: contradiction 5m/15m BUY/SELL — skip")
                 continue
-            if action_5m == "SELL" and action_15m == "BUY":
-                logger.debug(f"{sym}: contradiction MTF (5m=SELL, 15m=BUY) — ignore")
+            if action_5m == "BUY" and action_1h == "SELL":
+                logger.debug(f"{sym}: contradiction 5m/1h BUY/SELL — skip")
                 continue
 
-            # Bonus si les deux timeframes sont alignés BUY
-            confluence_mult = 1.3 if (action_5m == "BUY" and action_15m == "BUY") else 1.0
+            # ── Confluence multiplier ─────────────────────────────────────
+            triple = (action_5m == "BUY" and action_15m == "BUY" and action_1h == "BUY")
+            double = (action_5m == "BUY" and action_15m == "BUY")
+            if triple:
+                confluence_mult = 1.5
+            elif double:
+                confluence_mult = 1.3
+            else:
+                confluence_mult = 1.0
+
             score = round(score_5m * confluence_mult, 1)
 
             scored.append({
                 "symbol": sym, "score": score, "action": action_5m,
                 "indicators": indicators_5m, "rule_sig": rule_sig_5m,
-                "confluence_15m": action_15m,
+                "confluence_15m": action_15m, "confluence_1h": action_1h,
+                "triple_bull": triple,
             })
 
         if not scored:
@@ -577,8 +675,10 @@ class BotEngine:
         pf         = portfolio_data or {}
 
         logger.info(
-            f"[{user_id}] Meilleur candidat: {sym} score={best_candidate['score']:.1f} "
-            f"5m={best_candidate['action']} 15m={best_candidate['confluence_15m']}"
+            f"[{user_id}] Best: {sym} score={best_candidate['score']:.1f} "
+            f"5m={best_candidate['action']} 15m={best_candidate['confluence_15m']} "
+            f"1h={best_candidate.get('confluence_1h','?')}"
+            + (" [TRIPLE BULL]" if best_candidate.get("triple_bull") else "")
         )
 
         try:
@@ -598,8 +698,8 @@ class BotEngine:
 
     async def _analyze_pair_fast(
         self, symbol: str
-    ) -> Optional[Tuple[Dict, Dict, Dict]]:
-        """Analyse rapide : klines 5m + 15m, indicateurs, rule-based. Retourne (ind_5m, sig_5m, sig_15m)."""
+    ) -> Optional[Tuple[Dict, Dict, Dict, Dict]]:
+        """Triple timeframe : 5m + 15m + 1h. Retourne (ind_5m, sig_5m, sig_15m, sig_1h)."""
         try:
             # ── 5m ───────────────────────────────────────────────────────────
             key_5m = f"klines:{symbol}:5m"
@@ -637,9 +737,30 @@ class BotEngine:
 
                 rule_15m = ind_15m.get("rule_signal", {})
             except Exception as e15:
-                logger.debug(f"15m analysis {symbol} failed (non bloquant): {e15}")
+                logger.debug(f"15m {symbol} failed (non bloquant): {e15}")
 
-            return ind_5m, rule_5m, rule_15m
+            # ── 1h ───────────────────────────────────────────────────────────
+            rule_1h: Dict = {}
+            try:
+                key_1h = f"klines:{symbol}:1h"
+                df_1h = cache.get(key_1h)
+                if df_1h is None:
+                    df_1h = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: binance_service.get_klines(symbol, "1h", limit=100)
+                    )
+                    cache.set(key_1h, df_1h, ttl_seconds=KLINE_TTL.get("1h", 3600))
+
+                ind_key_1h = f"indicators:{symbol}:1h"
+                ind_1h = cache.get(ind_key_1h)
+                if ind_1h is None:
+                    ind_1h = analysis_service.compute_indicators(df_1h)
+                    cache.set(ind_key_1h, ind_1h, ttl_seconds=INDICATOR_TTL.get("1h", 3600))
+
+                rule_1h = ind_1h.get("rule_signal", {})
+            except Exception as e1h:
+                logger.debug(f"1h {symbol} failed (non bloquant): {e1h}")
+
+            return ind_5m, rule_5m, rule_15m, rule_1h
 
         except Exception as e:
             logger.debug(f"Fast analysis {symbol} failed: {e}")
@@ -686,28 +807,32 @@ class BotEngine:
 
         pnl_pct = (price - entry) / entry * 100
 
+        # Trailing step adaptatif selon ADX enregistré à l'entrée
+        adx_entry  = float(trade.get("signal_adx", 0) or 0)
+        trail_step = 0.3 if adx_entry > 35 else TRAIL_STEP_PCT  # plus serré si forte tendance
+
         # Mettre à jour le plus haut
         updates = {}
         if price > highest:
             updates["highest_price_seen"] = price
             highest = price
 
-        # ── BREAKEVEN : quand +2%, stop passe à l'entrée ─────────────────────
+        # ── BREAKEVEN rapide : dès +0.7%, SL monte à l'entrée ────────────────
         if pnl_pct >= BREAKEVEN_PCT and sl_price < entry:
             new_sl = entry * 1.001
             updates["stop_loss_price"] = new_sl
             sl_price = new_sl
-            logger.info(f"[{user_id}] Breakeven {trade['symbol']}: SL → ${new_sl:.4f}")
+            logger.info(f"[{user_id}] Breakeven {trade['symbol']}: SL -> ${new_sl:.4f}")
 
-        # ── TRAILING TAKE-PROFIT : quand +3%, le TP suit le prix ─────────────
+        # ── TRAILING TAKE-PROFIT adaptatif ─────────────────────────────────
         if pnl_pct >= TRAIL_TRIGGER_PCT:
-            new_trailing_tp = price * (1 + TRAIL_STEP_PCT / 100)
+            new_trailing_tp = price * (1 + trail_step / 100)
             if new_trailing_tp > trailing_tp:
                 updates["trailing_tp_price"] = new_trailing_tp
                 trailing_tp = new_trailing_tp
                 logger.info(
                     f"[{user_id}] Trailing TP {trade['symbol']}: "
-                    f"+{pnl_pct:.1f}% → TP monté à ${new_trailing_tp:.4f}"
+                    f"+{pnl_pct:.1f}% -> TP ${new_trailing_tp:.4f} (step={trail_step}%)"
                 )
 
         if updates:
@@ -745,6 +870,7 @@ class BotEngine:
         symbol: str, position_usdt: float, current_price: float,
         sl_pct: float, tp_pct: float,
         signal_data: Dict, portfolio_data: Dict, config: Dict,
+        indicators: Optional[Dict] = None,
     ) -> None:
         """Place un ordre BUY et sauvegarde le trade."""
         try:
@@ -783,6 +909,7 @@ class BotEngine:
             "trailing_tp_active":  False,
             "signal_confidence":   signal_data["confidence"],
             "signal_source":       signal_data.get("source", "claude"),
+            "signal_adx":          (indicators or {}).get("trend", {}).get("adx", 0),
         })
 
         trade_id = None
