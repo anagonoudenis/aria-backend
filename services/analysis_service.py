@@ -11,13 +11,13 @@ logger = get_logger(__name__)
 # INDICATEURS TECHNIQUES COMPLETS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
+def compute_indicators(df: pd.DataFrame, symbol: str = "") -> Dict[str, Any]:
     try:
         df = df.copy()
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = df[col].astype(float)
 
-        indicators: Dict[str, Any] = {}
+        indicators: Dict[str, Any] = {"_symbol": symbol}
 
         # Tendance
         df["sma_20"]  = ta.trend.sma_indicator(df["close"], window=20)
@@ -258,6 +258,16 @@ def generate_momentum_signal(indicators: Dict[str, Any], df: pd.DataFrame) -> Di
                 sell_pts.append((p, 2))
 
         sell_score = sum(v for _, v in sell_pts)
+
+        # ── Biais TradingAgents Intelligence ─────────────────────────────────
+        from services.research_reader import get_bias_sync
+        _bias = get_bias_sync(indicators.get("_symbol", ""))
+        if _bias:
+            _bs = _bias["bias_score"]
+            if _bs > 0:
+                buy_score  += _bs
+            elif _bs < 0:
+                sell_score += abs(_bs)
 
         # ── Décision : seuil 4 pts minimum ───────────────────────────────────
         THRESHOLD = 4

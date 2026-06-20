@@ -8,7 +8,7 @@ import uvicorn
 
 from config import settings
 from database import connect_db, disconnect_db
-from routers import auth, bot, trades, portfolio, signals, websocket, market, backtest
+from routers import auth, bot, trades, portfolio, signals, websocket, market, backtest, research
 from utils.logger import get_logger
 from utils.security import SECURITY_HEADERS, _rate_limiter
 
@@ -100,6 +100,12 @@ async def startup_event():
             await _rate_limiter.cleanup()
     asyncio.create_task(_cache_cleaner())
 
+    # Chargement du dernier rapport TradingAgents (tâche de fond, non bloquant)
+    async def _load_research_cache():
+        from services.research_reader import refresh_cache
+        await refresh_cache()
+    asyncio.create_task(_load_research_cache())
+
     logger.info("API v2.0 ready — bots auto-restarted")
 
 
@@ -158,6 +164,7 @@ app.include_router(portfolio.router, prefix=PREFIX)
 app.include_router(signals.router,   prefix=PREFIX)
 app.include_router(market.router,    prefix=PREFIX)
 app.include_router(backtest.router,  prefix=PREFIX)
+app.include_router(research.router,  prefix=PREFIX)
 app.include_router(websocket.router, prefix=PREFIX)
 
 

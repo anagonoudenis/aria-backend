@@ -35,6 +35,12 @@ class RiskManager:
         if action == "HOLD":
             return False, "Signal HOLD"
 
+        # Veto TradingAgents : bloque un BUY si la recherche dit SELL
+        from services.research_reader import get_bias_sync
+        bias = get_bias_sync(signal.get("symbol", ""))
+        if bias and bias.get("rating") == "SELL" and action == "BUY":
+            return False, f"TradingAgents SELL — BUY bloqué sur {signal.get('symbol', '')}"
+
         confidence = signal.get("confidence", 0.0)
         if confidence < MIN_CONFIDENCE:
             return False, f"Confiance insuffisante: {confidence:.2f} < {MIN_CONFIDENCE}"
@@ -68,15 +74,28 @@ class RiskManager:
         entry_price: float,
         stop_loss_pct: float,
         max_positions: int = 1,
+        symbol: str = "",
     ) -> float:
         """
         Taille adaptative : divise le capital par le nombre de positions max.
-        Toujours au-dessus du min notional Binance ($5.50).
+        Applique un multiplicateur TradingAgents selon la conviction multi-agents.
         """
         size = (usdt_available / max(max_positions, 1)) * 0.90
-        size = max(size, 5.50)                  # plancher min notional
-        size = min(size, usdt_available * 0.95) # plafond sécurité
-        logger.info(f"Position size: {size:.2f} USDT (capital={usdt_available:.2f}, slots={max_positions})")
+
+        # Multiplicateur TradingAgents Intelligence
+        from services.research_reader import get_bias_sync
+        bias = get_bias_sync(symbol)
+        if bias:
+            rating = bias.get("rating", "HOLD")
+            if rating == "SELL":
+                return 0.0
+            multiplier = bias.get("size_multiplier", 1.0)
+            size = size * multiplier
+            logger.info(f"TradingAgents ×{multiplier:.1f} ({rating}) sur {symbol}")
+
+        size = max(size, 5.50)
+        size = min(size, usdt_available * 0.95)
+        logger.info(f"Position size: {size:.2f} USDT (capital={usdt_available:.2f})")
         return size
 
     def kelly_position_size(

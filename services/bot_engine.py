@@ -420,7 +420,7 @@ class BotEngine:
             key_ind = "indicators:BTCUSDT:15m"
             ind = cache.get(key_ind)
             if ind is None:
-                ind = analysis_service.compute_indicators(df)
+                ind = analysis_service.compute_indicators(df, symbol="BTCUSDT")
                 cache.set(key_ind, ind, ttl_seconds=INDICATOR_TTL.get("15m", 900))
 
             trend   = ind.get("trend", {})
@@ -713,7 +713,7 @@ class BotEngine:
             ind_key_5m = f"indicators:{symbol}:5m"
             ind_5m = cache.get(ind_key_5m)
             if ind_5m is None:
-                ind_5m = analysis_service.compute_indicators(df_5m)
+                ind_5m = analysis_service.compute_indicators(df_5m, symbol=symbol)
                 cache.set(ind_key_5m, ind_5m, ttl_seconds=INDICATOR_TTL.get("5m", 300))
 
             rule_5m = ind_5m.get("rule_signal", {})
@@ -732,7 +732,7 @@ class BotEngine:
                 ind_key_15m = f"indicators:{symbol}:15m"
                 ind_15m = cache.get(ind_key_15m)
                 if ind_15m is None:
-                    ind_15m = analysis_service.compute_indicators(df_15m)
+                    ind_15m = analysis_service.compute_indicators(df_15m, symbol=symbol)
                     cache.set(ind_key_15m, ind_15m, ttl_seconds=INDICATOR_TTL.get("15m", 900))
 
                 rule_15m = ind_15m.get("rule_signal", {})
@@ -753,7 +753,7 @@ class BotEngine:
                 ind_key_1h = f"indicators:{symbol}:1h"
                 ind_1h = cache.get(ind_key_1h)
                 if ind_1h is None:
-                    ind_1h = analysis_service.compute_indicators(df_1h)
+                    ind_1h = analysis_service.compute_indicators(df_1h, symbol=symbol)
                     cache.set(ind_key_1h, ind_1h, ttl_seconds=INDICATOR_TTL.get("1h", 3600))
 
                 rule_1h = ind_1h.get("rule_signal", {})
