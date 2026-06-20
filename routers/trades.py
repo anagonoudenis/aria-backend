@@ -121,6 +121,7 @@ async def get_trade_stats(
     )
 
 
+@router.get("/open")
 @router.get("/open/live")
 async def get_open_trades_live(
     current_user: UserInDB = Depends(get_current_user),
