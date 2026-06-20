@@ -4,13 +4,14 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-MAX_DRAWDOWN_PCT       = 15.0
-MAX_DAILY_LOSS_PCT     = 5.0
-MIN_CONFIDENCE         = 0.60   # filtre strict — seulement bons signaux
-MIN_USDT               = 5.50   # au-dessus du min notional Binance ($5)
-CIRCUIT_BREAKER_LOSSES = 5      # 5 pertes consécutives avant pause
-MAX_ATR_RATIO          = 4.0
-KELLY_FRACTION         = 0.25
+MAX_DRAWDOWN_PCT       = 10.0   # 10% max drawdown (conservateur micro-compte)
+MAX_DAILY_LOSS_PCT     = 3.0    # 3% perte max par jour
+MIN_CONFIDENCE         = 0.65   # 65% min — signaux haute qualité uniquement
+MIN_USDT               = 5.50   # min notional Binance + marge
+MIN_ACCOUNT_USDT       = 6.0    # arrêt complet si capital < 6 USDT
+CIRCUIT_BREAKER_LOSSES = 3      # pause après 3 pertes consécutives
+MAX_ATR_RATIO          = 3.0    # volatilité max réduite
+KELLY_FRACTION         = 0.20   # Kelly conservateur
 
 CORRELATED_PAIRS = [
     {"BTCUSDT", "ETHUSDT"},
@@ -34,6 +35,11 @@ class RiskManager:
         action = signal.get("action", "HOLD")
         if action == "HOLD":
             return False, "Signal HOLD"
+
+        # Garde-fou capital minimum absolu
+        total_usdt = portfolio.get("total_usdt", portfolio.get("available_usdt", 0))
+        if total_usdt < MIN_ACCOUNT_USDT:
+            return False, f"Capital insuffisant pour trader: {total_usdt:.2f} < {MIN_ACCOUNT_USDT} USDT"
 
         # Veto TradingAgents : bloque un BUY si la recherche dit SELL
         from services.research_reader import get_bias_sync
