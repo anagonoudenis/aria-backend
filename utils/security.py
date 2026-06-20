@@ -124,8 +124,8 @@ async def check_rate_limit(
 
 # Dépendances préconfigurées pour les endpoints sensibles
 async def auth_rate_limit(request: Request) -> None:
-    """Max 10 tentatives par minute par IP sur les endpoints d'authentification."""
-    await check_rate_limit(request, max_requests=10, window_seconds=60, endpoint_name="auth")
+    """Max 30 tentatives par minute par IP sur les endpoints d'authentification."""
+    await check_rate_limit(request, max_requests=30, window_seconds=60, endpoint_name="auth")
 
 
 async def strict_rate_limit(request: Request) -> None:

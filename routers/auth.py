@@ -8,7 +8,7 @@ from passlib.context import CryptContext
 from database import get_database
 from models.user import UserCreate, UserLogin, UserInDB, UserResponse, TokenResponse, BotConfig
 from utils.jwt import create_access_token, verify_token
-from utils.security import validate_password_strength, validate_email, auth_rate_limit
+from utils.security import validate_password_strength, validate_email, auth_rate_limit, check_rate_limit
 from utils.cache import cache
 from config import settings
 from utils.logger import get_logger
@@ -166,6 +166,33 @@ async def login(
             id=user.id, email=user.email, is_active=user.is_active,
             created_at=user.created_at, bot_config=user.bot_config,
         ),
+    )
+
+
+# ── CLI TOKEN — limite séparée, pour le monitor SIRIUS ───────────────────────
+@router.post("/cli-token", response_model=TokenResponse)
+async def cli_token(
+    payload: UserLogin,
+    request: Request,
+    db=Depends(get_database),
+):
+    """Endpoint dédié au CLI monitor — rate limit souple (20/heure par IP)."""
+    await check_rate_limit(request, max_requests=20, window_seconds=3600, endpoint_name="cli-token")
+    _DUMMY_HASH = "$2b$12$EIXbf8mGXGy5vZXvqFSHQeZH0.3.wNWVKFzMqJzVZhKNLTxUbGrq2"
+    user_doc    = await db.users.find_one({"email": payload.email.lower()})
+    stored_hash = user_doc["hashed_password"] if user_doc else _DUMMY_HASH
+    password_ok = verify_password(payload.password, stored_hash)
+    if not user_doc or not password_ok:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Email ou mot de passe incorrect")
+    user  = UserInDB.from_mongo(user_doc)
+    token = create_access_token(
+        data={"sub": user.id},
+        expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
+    )
+    return TokenResponse(
+        access_token=token,
+        user=UserResponse(id=user.id, email=user.email, is_active=user.is_active,
+                          created_at=user.created_at, bot_config=user.bot_config),
     )
 
 
