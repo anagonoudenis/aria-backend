@@ -619,31 +619,36 @@ class BotEngine:
             vol_ratio  = volume_ind.get("volume_ratio", 1.0)
             macd_h     = trend_5m.get("macd_histogram", 0)
 
-            # ── Déterminer le signal effectif et le score à utiliser ──────
-            # En BEAR : si 5m pullback (SELL/HOLD) + 15m/1h BUY → "buy the dip"
-            # C'est la meilleure opportunité en marché baissier
+            # ── Déterminer le signal effectif ────────────────────────────
             effective_action = action_5m
             effective_score  = score_5m
 
             if market_mode == "BEAR":
+                # Cas 1 : RSI extrêmement oversold (< 28) → achat rebond forcé
+                extreme_oversold = rsi < 28
+                # Cas 2 : buy-the-dip — 5m baissier + AU MOINS UN TF sup haussier
                 btd = (action_5m in ("SELL", "HOLD") and
-                       action_15m == "BUY" and
-                       action_1h  == "BUY" and
-                       rsi < 52)
-                if btd:
-                    # "Buy The Dip" — traiter comme BUY avec le score 15m
+                       (action_15m == "BUY" or action_1h == "BUY") and
+                       rsi < 55)
+
+                if extreme_oversold:
+                    effective_action = "BUY"
+                    effective_score  = max(score_5m, 6)
+                    logger.info(f"[{user_id}] {sym}: OVERSOLD EXTREME RSI={rsi:.0f} → BUY force")
+                elif btd:
                     effective_action = "BUY"
                     effective_score  = max(score_5m, score_15m)
-                    logger.debug(f"{sym}: BUY THE DIP — 5m={action_5m} 15m=BUY 1h=BUY RSI={rsi:.0f}")
+                    logger.info(f"[{user_id}] {sym}: BUY-THE-DIP 5m={action_5m} 15m={action_15m} 1h={action_1h} RSI={rsi:.0f}")
 
             # ── Ignorer si pas BUY et pas de position à fermer ───────────
             if effective_action != "BUY" and sym not in open_symbols:
+                logger.debug(f"{sym}: {action_5m} sans position — ignore")
                 continue
 
             # ── Score minimum ─────────────────────────────────────────────
             min_raw = MIN_SCORE_RAW_BEAR if market_mode == "BEAR" else MIN_SCORE_RAW_BULL
             if effective_score < min_raw:
-                logger.debug(f"{sym}: score {effective_score} < {min_raw} — skip")
+                logger.info(f"[{user_id}] {sym}: score {effective_score} < {min_raw} ({market_mode}) — skip")
                 continue
 
             # ── Filtres qualité pour BUY ──────────────────────────────────
@@ -651,7 +656,7 @@ class BotEngine:
                 # ADX minimum
                 adx_min = MIN_ADX_BEAR if market_mode == "BEAR" else MIN_ADX_BULL
                 if adx < adx_min:
-                    logger.debug(f"{sym}: ADX={adx:.1f} < {adx_min} — skip")
+                    logger.info(f"[{user_id}] {sym}: ADX={adx:.1f} < {adx_min} ({market_mode}) — skip")
                     continue
 
                 # Volume minimum
