@@ -273,7 +273,19 @@ def generate_momentum_signal(indicators: Dict[str, Any], df: pd.DataFrame) -> Di
         THRESHOLD = 4
 
         if buy_score >= THRESHOLD and buy_score > sell_score:
-            conf = min(0.40 + (buy_score - THRESHOLD) * 0.04, 0.92)
+            # Confiance multi-factorielle : base + bonus ADX + bonus patterns + bonus separation
+            base_conf = 0.40 + (buy_score - THRESHOLD) * 0.04
+            # Bonus ADX fort (tendance confirmée)
+            if adx > 25:  base_conf += 0.06
+            elif adx > 18: base_conf += 0.03
+            # Bonus separation nette buy vs sell
+            separation = buy_score - sell_score
+            if separation >= 6: base_conf += 0.05
+            elif separation >= 4: base_conf += 0.02
+            # Bonus patterns haussiers détectés
+            patterns = indicators.get("patterns", {})
+            if patterns.get("bullish_count", 0) >= 2: base_conf += 0.04
+            conf = min(base_conf, 0.92)
             reasons = [r for r, _ in buy_pts[:5]]
             return {
                 "action":         "BUY",
@@ -286,7 +298,15 @@ def generate_momentum_signal(indicators: Dict[str, Any], df: pd.DataFrame) -> Di
             }
 
         elif sell_score >= THRESHOLD and sell_score > buy_score:
-            conf = min(0.40 + (sell_score - THRESHOLD) * 0.04, 0.92)
+            base_conf = 0.40 + (sell_score - THRESHOLD) * 0.04
+            if adx > 25:  base_conf += 0.06
+            elif adx > 18: base_conf += 0.03
+            separation = sell_score - buy_score
+            if separation >= 6: base_conf += 0.05
+            elif separation >= 4: base_conf += 0.02
+            patterns = indicators.get("patterns", {})
+            if patterns.get("bearish_count", 0) >= 2: base_conf += 0.04
+            conf = min(base_conf, 0.92)
             reasons = [r for r, _ in sell_pts[:5]]
             return {
                 "action":         "SELL",

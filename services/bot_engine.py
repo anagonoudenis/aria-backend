@@ -20,36 +20,52 @@ logger = get_logger(__name__)
 INTERVAL_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
 BINANCE_FEE      = 0.001
 
-# 12 paires liquides — min notional $5 sur Binance Spot
+# 20 paires liquides — couvre bull ET bear market
 SCAN_PAIRS = [
-    "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT",
-    "DOTUSDT", "LTCUSDT", "TRXUSDT", "LINKUSDT", "AVAXUSDT",
-    "MATICUSDT", "ETHUSDT",
+    "BNBUSDT",  "SOLUSDT",  "XRPUSDT",  "DOGEUSDT", "ADAUSDT",
+    "DOTUSDT",  "LTCUSDT",  "TRXUSDT",  "LINKUSDT", "AVAXUSDT",
+    "MATICUSDT","ETHUSDT",  "SHIBUSDT", "UNIUSDT",  "ATOMUSDT",
+    "NEARUSDT", "APTUSDT",  "ARBUSDT",  "OPUSDT",   "INJUSDT",
 ]
 # Paires nécessitant min notional $10 — exclues si capital < $15
 HIGH_NOTIONAL_PAIRS = {"BTCUSDT", "ETHUSDT"}
 
-# TP/SL — ratio 3:1 garanti
-TRAIL_TRIGGER_PCT  = 1.0   # trailing TP déclenché dès +1%
-TRAIL_STEP_PCT     = 0.5
-BREAKEVEN_PCT      = 0.7
+# TP/SL — ratio 2.5:1
+TRAIL_TRIGGER_PCT  = 0.8   # trailing TP déclenché dès +0.8%
+TRAIL_STEP_PCT     = 0.4
+BREAKEVEN_PCT      = 0.5
 STOP_LOSS_PCT      = 0.8
-TAKE_PROFIT_PCT    = 2.5   # ratio 3:1 (2.5/0.8)
+TAKE_PROFIT_PCT    = 2.0   # ratio 2.5:1
 
 # Scalping haute confiance — TP rapide, SL serré
-SCALP_CONFIDENCE   = 0.85
-SCALP_SL_PCT       = 0.35  # serré pour préserver le capital
-SCALP_TP_PCT       = 1.0
+SCALP_CONFIDENCE   = 0.80
+SCALP_SL_PCT       = 0.30
+SCALP_TP_PCT       = 0.8
 
-# Filtres qualité — seulement les meilleurs signaux
-MIN_CONFIDENCE       = 0.80  # confiance minimum 80%
-MIN_COMPOSITE_SCORE  = 28.0  # score brut ≥ 8 × 1.3 confluence × 10 conf
-MIN_SCORE_RAW        = 8     # score rule-based minimum 8/15
-MIN_ADX              = 25    # tendance forte confirmée
-MIN_VOLUME_RATIO     = 2.0   # volume 2x la moyenne
-MAX_CONSECUTIVE_LOSSES = 5
-SL_COOLDOWN_SECONDS  = 45 * 60  # 45 min cooldown par paire après SL
-DAILY_MAX_LOSS_PCT   = 5.0       # stoppe si perte journalière > 5% du capital
+# ── Filtres BULL market (BTC > EMA21) ────────────────────────────────────────
+MIN_CONFIDENCE_BULL      = 0.62   # 62% confiance
+MIN_COMPOSITE_SCORE_BULL = 3.8    # score×conf ≥ 3.8 (ex: score6×conf0.65=3.9 ✓)
+MIN_SCORE_RAW_BULL       = 5      # 5/15 points minimum
+MIN_ADX_BULL             = 12     # tendance légère acceptable en 5m
+MIN_VOLUME_RATIO_BULL    = 1.3    # volume 1.3x la moyenne
+
+# ── Filtres BEAR market (BTC < EMA21) — rebonds oversold uniquement ──────────
+MIN_CONFIDENCE_BEAR      = 0.65   # 65% confiance
+MIN_COMPOSITE_SCORE_BEAR = 4.2    # légèrement plus strict
+MIN_SCORE_RAW_BEAR       = 6      # 6/15 minimum en bear
+MIN_ADX_BEAR             = 10     # ADX très souple en bear
+MIN_VOLUME_RATIO_BEAR    = 1.8    # volume fort requis pour rebond
+RSI_OVERSOLD_BEAR        = 55     # RSI < 55 (assez large pour capturer rebonds)
+
+# Aliases (compatibilité)
+MIN_CONFIDENCE      = MIN_CONFIDENCE_BULL
+MIN_COMPOSITE_SCORE = MIN_COMPOSITE_SCORE_BULL
+MIN_SCORE_RAW       = MIN_SCORE_RAW_BULL
+MIN_ADX             = MIN_ADX_BULL
+MIN_VOLUME_RATIO    = MIN_VOLUME_RATIO_BULL
+MAX_CONSECUTIVE_LOSSES = 6       # 6 pertes consécutives avant pause
+SL_COOLDOWN_SECONDS  = 15 * 60  # 15 min cooldown par paire (au lieu de 45)
+DAILY_MAX_LOSS_PCT   = 4.0       # stoppe si perte journalière > 4% du capital
 
 _active_cycles: set = set()
 
@@ -139,9 +155,9 @@ class BotEngine:
             logger.warning(f"[{user_id}] Circuit breaker actif — cycle ignore")
             return
 
-        # ── 0. Filtre horaire — pas de trade entre 1h et 7h UTC ─────────────
+        # ── 0. Filtre horaire — seulement les 2h les plus creuses (3h-5h UTC) ──
         utc_hour = datetime.now(timezone.utc).hour
-        if 1 <= utc_hour < 7:
+        if 3 <= utc_hour < 5:
             logger.info(f"[{user_id}] Heure creuse ({utc_hour}h UTC) — cycle skip")
             return
 
@@ -209,14 +225,10 @@ class BotEngine:
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # ── 4b. Filtre BTC macro — pas de BUY si BTC en tendance baissière ──────
-        btc_ok, btc_reason = await self._check_btc_macro()
-        if not btc_ok:
-            logger.info(f"[{user_id}] Filtre BTC: {btc_reason}")
-            bot_info["cycles_count"] += 1
-            bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-            return
-        logger.info(f"[{user_id}] BTC macro OK — {btc_reason}")
+        # ── 4b. Mode marché BTC — adapte la stratégie (ne bloque plus tout) ───
+        market_mode, btc_reason = await self._get_market_mode()
+        bot_info["market_mode"] = market_mode
+        logger.info(f"[{user_id}] Mode marche: {market_mode} — {btc_reason}")
 
         # ── 5. Positions ouvertes + limite adaptative ─────────────────────────
         open_trades = await db.trades.find(
@@ -237,7 +249,7 @@ class BotEngine:
         )
 
         if best is None:
-            logger.info(f"[{user_id}] Aucune opportunité ce cycle")
+            logger.info(f"[{user_id}] Aucune opportunite ce cycle (mode={market_mode})")
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
@@ -250,7 +262,7 @@ class BotEngine:
         logger.info(
             f"[{user_id}] Signal: {symbol} "
             f"action={signal_data['action']} conf={signal_data['confidence']:.0%} "
-            f"score={best['composite_score']:.1f}"
+            f"score={best['composite_score']:.1f} mode={market_mode}"
         )
 
         # ── 7. Sauvegarder le signal ──────────────────────────────────────────
@@ -259,44 +271,62 @@ class BotEngine:
             **signal_data, "symbol": symbol, "price": current_price
         })
 
-        # ── 8. Filtres qualité — seulement les bons signaux ───────────────────
+        # ── 8. Filtres qualité adaptés au mode marché ─────────────────────────
         if signal_data["action"] != "BUY":
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        if signal_data["confidence"] < MIN_CONFIDENCE:
+        # Seuils selon mode marché
+        if market_mode == "BULL":
+            min_conf  = MIN_CONFIDENCE_BULL
+            min_score = MIN_COMPOSITE_SCORE_BULL
+        elif market_mode == "BEAR":
+            min_conf  = MIN_CONFIDENCE_BEAR
+            min_score = MIN_COMPOSITE_SCORE_BEAR
+            # En bear : vérifier RSI oversold extrême sur la paire
+            rsi = indicators.get("momentum", {}).get("rsi", 50)
+            if rsi > RSI_OVERSOLD_BEAR:
+                logger.info(f"[{user_id}] BEAR mode: RSI {rsi:.1f} > {RSI_OVERSOLD_BEAR} — trade refuse (pas assez oversold)")
+                bot_info["cycles_count"] += 1
+                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+                return
+        else:  # NEUTRAL
+            min_conf  = (MIN_CONFIDENCE_BULL + MIN_CONFIDENCE_BEAR) / 2
+            min_score = (MIN_COMPOSITE_SCORE_BULL + MIN_COMPOSITE_SCORE_BEAR) / 2
+
+        if signal_data["confidence"] < min_conf:
             logger.info(
                 f"[{user_id}] Confiance {signal_data['confidence']:.0%} "
-                f"< {MIN_CONFIDENCE:.0%} — signal ignore"
+                f"< {min_conf:.0%} ({market_mode}) — signal ignore"
             )
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        if best["composite_score"] < MIN_COMPOSITE_SCORE:
+        if best["composite_score"] < min_score:
             logger.info(
                 f"[{user_id}] Score {best['composite_score']:.1f} "
-                f"< {MIN_COMPOSITE_SCORE} — signal ignore"
+                f"< {min_score} ({market_mode}) — signal ignore"
             )
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # ── 8b. Filtre régime de marché — refuse les mauvaises conditions ────
-        market_regime   = signal_data.get("market_regime", "RANGING")
-        tf_alignment    = signal_data.get("timeframe_alignment", "MODERATE")
+        # ── 8b. Filtre régime de marché — refuse uniquement les cas extrêmes ─
+        market_regime = signal_data.get("market_regime", "RANGING")
+        tf_alignment  = signal_data.get("timeframe_alignment", "MODERATE")
 
-        # Jamais acheter en tendance baissière confirmée
-        if market_regime == "TRENDING_DOWN":
-            logger.info(f"[{user_id}] Regime TRENDING_DOWN — trade refuse")
+        # Bloquer seulement les tendances baissières fortes en mode BEAR
+        if market_mode == "BEAR" and market_regime == "TRENDING_DOWN":
+            logger.info(f"[{user_id}] BEAR+TRENDING_DOWN — trade refuse")
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # Jamais acheter avec signal faible
-        if tf_alignment == "WEAK":
-            logger.info(f"[{user_id}] Alignement WEAK — trade refuse")
+        # Alignement WEAK toléré en BULL, bloqué en BEAR
+        if tf_alignment == "WEAK" and market_mode != "BULL":
+            logger.info(f"[{user_id}] Alignement WEAK en mode {market_mode} — trade refuse")
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
@@ -400,13 +430,13 @@ class BotEngine:
     # FILTRE BTC MACRO
     # ══════════════════════════════════════════════════════════════════════════
 
-    async def _check_btc_macro(self) -> Tuple[bool, str]:
+    async def _get_market_mode(self) -> Tuple[str, str]:
         """
-        Vérifie la direction macro de BTC sur 15m.
-        Conditions pour trader :
-          - BTC close > EMA21 (tendance court terme haussière)
-          - EMA21 > SMA50  (structure de tendance confirmée)
-        Retourne (can_trade: bool, reason: str).
+        Détermine le mode de marché actuel : BULL / BEAR / NEUTRAL.
+        Ne bloque JAMAIS les trades — adapte seulement les filtres.
+        BULL   → seuils assouplis, toutes paires
+        NEUTRAL→ seuils standard
+        BEAR   → seuils plus stricts, cherche uniquement les oversold extrêmes
         """
         try:
             key_df = "klines:BTCUSDT:15m"
@@ -423,26 +453,25 @@ class BotEngine:
                 ind = analysis_service.compute_indicators(df, symbol="BTCUSDT")
                 cache.set(key_ind, ind, ttl_seconds=INDICATOR_TTL.get("15m", 900))
 
-            trend   = ind.get("trend", {})
-            candles = ind.get("candles_summary", [])
+            trend     = ind.get("trend", {})
+            candles   = ind.get("candles_summary", [])
             btc_close = candles[-1]["close"] if candles else 0
             ema21     = trend.get("ema_21", 0)
             sma50     = trend.get("sma_50", 0)
 
             if btc_close <= 0 or ema21 <= 0:
-                return True, "donnees BTC indisponibles — trade autorise par defaut"
+                return "NEUTRAL", "donnees BTC indisponibles"
 
-            if btc_close < ema21:
-                return False, f"BTC {btc_close:.0f} < EMA21 {ema21:.0f} — marche baissier"
-
-            if sma50 > 0 and ema21 < sma50:
-                return False, f"BTC EMA21 {ema21:.0f} < SMA50 {sma50:.0f} — structure baissiere"
-
-            return True, f"BTC {btc_close:.0f} > EMA21 {ema21:.0f} — marche haussier"
+            if btc_close > ema21 and (sma50 == 0 or ema21 > sma50):
+                return "BULL", f"BTC {btc_close:.0f} > EMA21 {ema21:.0f}"
+            elif btc_close > ema21:
+                return "NEUTRAL", f"BTC haussier CT mais structure mixte"
+            else:
+                return "BEAR", f"BTC {btc_close:.0f} < EMA21 {ema21:.0f} — rebonds oversold uniquement"
 
         except Exception as e:
-            logger.warning(f"BTC macro check failed: {e} — trade autorise par defaut")
-            return True, "erreur BTC check — autorise par defaut"
+            logger.warning(f"Market mode check failed: {e}")
+            return "NEUTRAL", "erreur — mode NEUTRAL par defaut"
 
     # ══════════════════════════════════════════════════════════════════════════
     # PULLBACK ENTRY — ENTRÉE SUR RETOUR EMA9
@@ -578,9 +607,10 @@ class BotEngine:
             action_1h  = rule_sig_1h.get("action", "HOLD")
             score_5m   = rule_sig_5m.get("score", 0)
 
-            # ── Filtre score brut minimum 8/15 ────────────────────────────
-            if score_5m < MIN_SCORE_RAW:
-                logger.debug(f"{sym}: score {score_5m} < {MIN_SCORE_RAW} — skip")
+            # ── Score brut minimum adapté au mode marché ──────────────────
+            min_raw = MIN_SCORE_RAW_BEAR if market_mode == "BEAR" else MIN_SCORE_RAW_BULL
+            if score_5m < min_raw:
+                logger.debug(f"{sym}: score {score_5m} < {min_raw} ({market_mode}) — skip")
                 continue
 
             # ── Filtres BUY uniquement ────────────────────────────────────
@@ -590,57 +620,71 @@ class BotEngine:
                 volume_ind = indicators_5m.get("volume", {})
                 candles    = indicators_5m.get("candles_summary", [])
 
-                # ADX > 25 — tendance forte
+                # ADX — seuil adapté (plus souple en 5m)
                 adx = trend_5m.get("adx", 0)
-                if adx < MIN_ADX:
-                    logger.debug(f"{sym}: ADX={adx:.1f} < {MIN_ADX} — skip")
+                adx_min = MIN_ADX_BEAR if market_mode == "BEAR" else MIN_ADX_BULL
+                if adx < adx_min:
+                    logger.debug(f"{sym}: ADX={adx:.1f} < {adx_min} ({market_mode}) — skip")
                     continue
 
-                # Volume 2x la moyenne
+                # Volume — seuil adapté au mode
                 vol_ratio = volume_ind.get("volume_ratio", 1.0)
-                if vol_ratio < MIN_VOLUME_RATIO:
-                    logger.debug(f"{sym}: vol={vol_ratio:.1f}x < {MIN_VOLUME_RATIO}x — skip")
+                vol_min = MIN_VOLUME_RATIO_BEAR if market_mode == "BEAR" else MIN_VOLUME_RATIO_BULL
+                if vol_ratio < vol_min:
+                    logger.debug(f"{sym}: vol={vol_ratio:.1f}x < {vol_min}x — skip")
                     continue
 
-                # RSI entre 35 et 65 — ni survendu profond, ni suracheté
+                # RSI — zone élargie selon mode
                 rsi = momentum.get("rsi", 50)
-                if not (35 <= rsi <= 65):
-                    logger.debug(f"{sym}: RSI={rsi:.1f} hors zone 35-65 — skip")
-                    continue
+                if market_mode == "BEAR":
+                    # En bear : uniquement oversold (RSI < 35) ou rebonds (RSI 35-50)
+                    if rsi > 55:
+                        logger.debug(f"{sym}: BEAR mode RSI={rsi:.1f} > 55 — skip")
+                        continue
+                elif market_mode == "BULL":
+                    # En bull : zone élargie RSI 30-70
+                    if not (30 <= rsi <= 70):
+                        logger.debug(f"{sym}: BULL mode RSI={rsi:.1f} hors 30-70 — skip")
+                        continue
+                else:  # NEUTRAL
+                    if not (32 <= rsi <= 68):
+                        logger.debug(f"{sym}: NEUTRAL RSI={rsi:.1f} hors 32-68 — skip")
+                        continue
 
-                # MACD histogram positif — momentum haussier confirmé
+                # MACD — obligatoire seulement en BULL et NEUTRAL
                 macd_h = trend_5m.get("macd_histogram", 0)
-                if macd_h <= 0:
-                    logger.debug(f"{sym}: MACD_h={macd_h:.6f} <= 0 — skip")
+                if market_mode != "BEAR" and macd_h <= 0:
+                    logger.debug(f"{sym}: MACD_h={macd_h:.6f} <= 0 ({market_mode}) — skip")
                     continue
 
-                # Anti-chasing — si dernière bougie déjà +0.8%, trop tard
+                # Anti-chasing — si dernière bougie déjà +1.2%, trop tard
                 if len(candles) >= 2:
                     last_c = candles[-1]
                     prev_c = candles[-2]
                     if prev_c.get("close", 0) > 0:
                         last_move = (last_c.get("close", 0) - prev_c.get("close", 0)) / prev_c.get("close", 0) * 100
-                        if last_move > 0.8:
+                        if last_move > 1.2:
                             logger.debug(f"{sym}: derniere bougie +{last_move:.2f}% — chasing skip")
                             continue
 
-            # ── Filtre tendance EMA : EMA9 > EMA21 ET close > EMA21 ──────
+            # ── Filtre tendance EMA — assoupli en BEAR ────────────────────
             if action_5m == "BUY":
                 trend_f = indicators_5m.get("trend", {})
                 cands_f = indicators_5m.get("candles_summary", [])
                 close_f = cands_f[-1]["close"] if cands_f else 0
                 ema9_f  = trend_f.get("ema_9", 0)
                 ema21_f = trend_f.get("ema_21", 0)
-                if not (ema9_f > ema21_f and close_f > ema21_f):
-                    logger.debug(f"{sym}: EMA filter — ema9={ema9_f:.4f} ema21={ema21_f:.4f}")
-                    continue
+                if market_mode == "BULL":
+                    # En bull : EMA9 > EMA21 requis
+                    if ema9_f > 0 and ema21_f > 0 and not (ema9_f > ema21_f):
+                        logger.debug(f"{sym}: BULL EMA filter — ema9<ema21")
+                        continue
+                # En BEAR/NEUTRAL : pas de filtre EMA (on cherche les rebonds)
 
-            # ── Contradiction MTF ─────────────────────────────────────────
-            if action_5m == "BUY" and action_15m == "SELL":
-                logger.debug(f"{sym}: contradiction 5m/15m BUY/SELL — skip")
-                continue
-            if action_5m == "BUY" and action_1h == "SELL":
-                logger.debug(f"{sym}: contradiction 5m/1h BUY/SELL — skip")
+            # ── Contradiction MTF — bloquer seulement si fort signal inverse ─
+            if action_5m == "BUY" and action_15m == "SELL" and action_1h == "SELL":
+                # Les deux TF supérieurs contre → skip
+                logger.debug(f"{sym}: contradiction 5m/15m+1h BUY/SELL — skip")
                 continue
 
             # ── Confluence multiplier ─────────────────────────────────────
@@ -687,7 +731,18 @@ class BotEngine:
             logger.warning(f"Claude failed for {sym}: {e} — using rule-based")
             signal_data = claude_service._from_rule(rule_sig, indicators)
 
-        composite = signal_data["confidence"] * 10 + best_candidate["score"]
+        # Score composite : score_brut × confiance (formule équilibrée)
+        # Exemple : score 8 × conf 0.65 = 5.2 → seuil BULL = 4.0 → PASSE
+        # Exemple : score 6 × conf 0.70 = 4.2 → seuil BULL = 4.0 → PASSE
+        # Bonus triple confluence
+        bonus = 1.5 if best_candidate.get("triple_bull") else 1.0
+        composite = round(best_candidate["score"] * signal_data["confidence"] * bonus, 2)
+
+        logger.info(
+            f"[{user_id}] Composite: {sym} "
+            f"score={best_candidate['score']} × conf={signal_data['confidence']:.2f} "
+            f"× bonus={bonus} = {composite:.2f} (seuil={MIN_COMPOSITE_SCORE_BULL if market_mode!='BEAR' else MIN_COMPOSITE_SCORE_BEAR})"
+        )
 
         return {
             "symbol":          sym,
