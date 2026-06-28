@@ -608,104 +608,124 @@ class BotEngine:
             action_15m = rule_sig_15m.get("action", "HOLD")
             action_1h  = rule_sig_1h.get("action", "HOLD")
             score_5m   = rule_sig_5m.get("score", 0)
+            score_15m  = rule_sig_15m.get("score", 0)
 
-            # ── Score brut minimum adapté au mode marché ──────────────────
-            min_raw = MIN_SCORE_RAW_BEAR if market_mode == "BEAR" else MIN_SCORE_RAW_BULL
-            if score_5m < min_raw:
-                logger.debug(f"{sym}: score {score_5m} < {min_raw} ({market_mode}) — skip")
+            trend_5m   = indicators_5m.get("trend", {})
+            momentum   = indicators_5m.get("momentum", {})
+            volume_ind = indicators_5m.get("volume", {})
+            candles    = indicators_5m.get("candles_summary", [])
+            rsi        = momentum.get("rsi", 50)
+            adx        = trend_5m.get("adx", 0)
+            vol_ratio  = volume_ind.get("volume_ratio", 1.0)
+            macd_h     = trend_5m.get("macd_histogram", 0)
+
+            # ── Déterminer le signal effectif et le score à utiliser ──────
+            # En BEAR : si 5m pullback (SELL/HOLD) + 15m/1h BUY → "buy the dip"
+            # C'est la meilleure opportunité en marché baissier
+            effective_action = action_5m
+            effective_score  = score_5m
+
+            if market_mode == "BEAR":
+                btd = (action_5m in ("SELL", "HOLD") and
+                       action_15m == "BUY" and
+                       action_1h  == "BUY" and
+                       rsi < 52)
+                if btd:
+                    # "Buy The Dip" — traiter comme BUY avec le score 15m
+                    effective_action = "BUY"
+                    effective_score  = max(score_5m, score_15m)
+                    logger.debug(f"{sym}: BUY THE DIP — 5m={action_5m} 15m=BUY 1h=BUY RSI={rsi:.0f}")
+
+            # ── Ignorer si pas BUY et pas de position à fermer ───────────
+            if effective_action != "BUY" and sym not in open_symbols:
                 continue
 
-            # ── Filtres BUY uniquement ────────────────────────────────────
-            if action_5m == "BUY":
-                trend_5m   = indicators_5m.get("trend", {})
-                momentum   = indicators_5m.get("momentum", {})
-                volume_ind = indicators_5m.get("volume", {})
-                candles    = indicators_5m.get("candles_summary", [])
+            # ── Score minimum ─────────────────────────────────────────────
+            min_raw = MIN_SCORE_RAW_BEAR if market_mode == "BEAR" else MIN_SCORE_RAW_BULL
+            if effective_score < min_raw:
+                logger.debug(f"{sym}: score {effective_score} < {min_raw} — skip")
+                continue
 
-                # ADX — seuil adapté (plus souple en 5m)
-                adx = trend_5m.get("adx", 0)
+            # ── Filtres qualité pour BUY ──────────────────────────────────
+            if effective_action == "BUY":
+                # ADX minimum
                 adx_min = MIN_ADX_BEAR if market_mode == "BEAR" else MIN_ADX_BULL
                 if adx < adx_min:
-                    logger.debug(f"{sym}: ADX={adx:.1f} < {adx_min} ({market_mode}) — skip")
+                    logger.debug(f"{sym}: ADX={adx:.1f} < {adx_min} — skip")
                     continue
 
-                # Volume — seuil adapté au mode
-                vol_ratio = volume_ind.get("volume_ratio", 1.0)
+                # Volume minimum
                 vol_min = MIN_VOLUME_RATIO_BEAR if market_mode == "BEAR" else MIN_VOLUME_RATIO_BULL
                 if vol_ratio < vol_min:
                     logger.debug(f"{sym}: vol={vol_ratio:.1f}x < {vol_min}x — skip")
                     continue
 
-                # RSI — zone élargie selon mode
-                rsi = momentum.get("rsi", 50)
+                # RSI — zone selon mode
                 if market_mode == "BEAR":
-                    # En bear : uniquement oversold (RSI < 35) ou rebonds (RSI 35-50)
-                    if rsi > 55:
-                        logger.debug(f"{sym}: BEAR mode RSI={rsi:.1f} > 55 — skip")
+                    if rsi > 58:
+                        logger.debug(f"{sym}: BEAR RSI={rsi:.1f} > 58 — skip")
                         continue
                 elif market_mode == "BULL":
-                    # En bull : zone élargie RSI 30-70
-                    if not (30 <= rsi <= 70):
-                        logger.debug(f"{sym}: BULL mode RSI={rsi:.1f} hors 30-70 — skip")
+                    if not (28 <= rsi <= 72):
+                        logger.debug(f"{sym}: BULL RSI={rsi:.1f} hors 28-72 — skip")
                         continue
-                else:  # NEUTRAL
-                    if not (32 <= rsi <= 68):
-                        logger.debug(f"{sym}: NEUTRAL RSI={rsi:.1f} hors 32-68 — skip")
+                else:
+                    if not (30 <= rsi <= 70):
+                        logger.debug(f"{sym}: NEUTRAL RSI={rsi:.1f} hors 30-70 — skip")
                         continue
 
-                # MACD — obligatoire seulement en BULL et NEUTRAL
-                macd_h = trend_5m.get("macd_histogram", 0)
-                if market_mode != "BEAR" and macd_h <= 0:
-                    logger.debug(f"{sym}: MACD_h={macd_h:.6f} <= 0 ({market_mode}) — skip")
+                # MACD requis seulement en BULL
+                if market_mode == "BULL" and macd_h <= 0:
+                    logger.debug(f"{sym}: BULL MACD_h={macd_h:.6f} <= 0 — skip")
                     continue
 
-                # Anti-chasing — si dernière bougie déjà +1.2%, trop tard
+                # Anti-chasing
                 if len(candles) >= 2:
                     last_c = candles[-1]
                     prev_c = candles[-2]
                     if prev_c.get("close", 0) > 0:
-                        last_move = (last_c.get("close", 0) - prev_c.get("close", 0)) / prev_c.get("close", 0) * 100
-                        if last_move > 1.2:
-                            logger.debug(f"{sym}: derniere bougie +{last_move:.2f}% — chasing skip")
+                        last_move = (last_c.get("close",0) - prev_c.get("close",0)) / prev_c.get("close",0) * 100
+                        if last_move > 1.5:
+                            logger.debug(f"{sym}: chasing +{last_move:.2f}% — skip")
                             continue
 
-            # ── Filtre tendance EMA — assoupli en BEAR ────────────────────
-            if action_5m == "BUY":
-                trend_f = indicators_5m.get("trend", {})
-                cands_f = indicators_5m.get("candles_summary", [])
-                close_f = cands_f[-1]["close"] if cands_f else 0
-                ema9_f  = trend_f.get("ema_9", 0)
-                ema21_f = trend_f.get("ema_21", 0)
+                # EMA requis seulement en BULL
                 if market_mode == "BULL":
-                    # En bull : EMA9 > EMA21 requis
-                    if ema9_f > 0 and ema21_f > 0 and not (ema9_f > ema21_f):
-                        logger.debug(f"{sym}: BULL EMA filter — ema9<ema21")
+                    ema9  = trend_5m.get("ema_9", 0)
+                    ema21 = trend_5m.get("ema_21", 0)
+                    if ema9 > 0 and ema21 > 0 and ema9 < ema21:
+                        logger.debug(f"{sym}: BULL EMA9<EMA21 — skip")
                         continue
-                # En BEAR/NEUTRAL : pas de filtre EMA (on cherche les rebonds)
 
-            # ── Contradiction MTF — bloquer seulement si fort signal inverse ─
-            if action_5m == "BUY" and action_15m == "SELL" and action_1h == "SELL":
-                # Les deux TF supérieurs contre → skip
-                logger.debug(f"{sym}: contradiction 5m/15m+1h BUY/SELL — skip")
-                continue
+                # Bloquer seulement si TOUS les TF sont baissiers
+                if action_5m == "SELL" and action_15m == "SELL" and action_1h == "SELL":
+                    logger.debug(f"{sym}: triple SELL — skip")
+                    continue
 
             # ── Confluence multiplier ─────────────────────────────────────
-            triple = (action_5m == "BUY" and action_15m == "BUY" and action_1h == "BUY")
-            double = (action_5m == "BUY" and action_15m == "BUY")
-            if triple:
+            triple = (action_15m == "BUY" and action_1h == "BUY")
+            double = (action_15m == "BUY" or action_1h  == "BUY")
+            if triple and action_5m == "BUY":
                 confluence_mult = 1.5
+            elif triple:
+                confluence_mult = 1.3   # buy-the-dip avec 15m+1h BUY
             elif double:
-                confluence_mult = 1.3
+                confluence_mult = 1.1
             else:
                 confluence_mult = 1.0
 
-            score = round(score_5m * confluence_mult, 1)
+            score = round(effective_score * confluence_mult, 1)
 
             scored.append({
-                "symbol": sym, "score": score, "action": action_5m,
-                "indicators": indicators_5m, "rule_sig": rule_sig_5m,
-                "confluence_15m": action_15m, "confluence_1h": action_1h,
-                "triple_bull": triple,
+                "symbol":         sym,
+                "score":          score,
+                "action":         effective_action,
+                "indicators":     indicators_5m,
+                "rule_sig":       rule_sig_5m,
+                "confluence_15m": action_15m,
+                "confluence_1h":  action_1h,
+                "triple_bull":    (action_5m == "BUY" and triple),
+                "buy_the_dip":    (effective_action == "BUY" and action_5m != "BUY"),
             })
 
         if not scored:
@@ -720,11 +740,11 @@ class BotEngine:
         price      = prices.get(sym, 0)
         pf         = portfolio_data or {}
 
+        tag = "[BUY-THE-DIP]" if best_candidate.get("buy_the_dip") else ("[TRIPLE BULL]" if best_candidate.get("triple_bull") else "")
         logger.info(
             f"[{user_id}] Best: {sym} score={best_candidate['score']:.1f} "
             f"5m={best_candidate['action']} 15m={best_candidate['confluence_15m']} "
-            f"1h={best_candidate.get('confluence_1h','?')}"
-            + (" [TRIPLE BULL]" if best_candidate.get("triple_bull") else "")
+            f"1h={best_candidate.get('confluence_1h','?')} {tag}"
         )
 
         try:
@@ -733,11 +753,17 @@ class BotEngine:
             logger.warning(f"Claude failed for {sym}: {e} — using rule-based")
             signal_data = claude_service._from_rule(rule_sig, indicators)
 
-        # Score composite : score_brut × confiance (formule équilibrée)
-        # Exemple : score 8 × conf 0.65 = 5.2 → seuil BULL = 4.0 → PASSE
-        # Exemple : score 6 × conf 0.70 = 4.2 → seuil BULL = 4.0 → PASSE
-        # Bonus triple confluence
-        bonus = 1.5 if best_candidate.get("triple_bull") else 1.0
+        # Forcer BUY si buy_the_dip et Claude hésite
+        if best_candidate.get("buy_the_dip") and signal_data.get("action") not in ("BUY",):
+            rule_action = best_candidate["rule_sig"].get("action", "HOLD")
+            rule_score  = best_candidate["rule_sig"].get("score", 0)
+            # Buy-the-dip : si 15m+1h sont BUY, ignorer les hésitations de Claude
+            if rule_score >= MIN_SCORE_RAW_BEAR:
+                signal_data["action"]     = "BUY"
+                signal_data["confidence"] = max(signal_data.get("confidence", 0.60), 0.62)
+                logger.info(f"[{user_id}] Buy-the-dip override: {sym} → BUY {signal_data['confidence']:.0%}")
+
+        bonus = 1.5 if best_candidate.get("triple_bull") else (1.2 if best_candidate.get("buy_the_dip") else 1.0)
         composite = round(best_candidate["score"] * signal_data["confidence"] * bonus, 2)
 
         logger.info(
