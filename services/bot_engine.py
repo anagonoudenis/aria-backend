@@ -245,7 +245,8 @@ class BotEngine:
 
         # ── 6. SCAN MULTI-PAIRES — meilleure opportunité ──────────────────────
         best = await self._scan_best_opportunity(
-            user_id, SCAN_PAIRS, open_symbols, prices, config, portfolio_data
+            user_id, SCAN_PAIRS, open_symbols, prices, config, portfolio_data,
+            market_mode=market_mode,
         )
 
         if best is None:
@@ -564,6 +565,7 @@ class BotEngine:
         prices: Dict[str, float],
         config: Dict[str, Any],
         portfolio_data: Optional[Dict[str, Any]] = None,
+        market_mode: str = "NEUTRAL",
     ) -> Optional[Dict[str, Any]]:
         """
         Analyse toutes les paires en parallèle et retourne la meilleure opportunité.
