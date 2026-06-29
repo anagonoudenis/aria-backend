@@ -650,10 +650,10 @@ class BotEngine:
                     logger.info(f"[{user_id}] {sym}: ADX={adx:.1f} < {adx_min} ({market_mode}) — skip")
                     continue
 
-                # Volume minimum
-                vol_min = MIN_VOLUME_RATIO_BEAR if market_mode == "BEAR" else MIN_VOLUME_RATIO_BULL
+                # Volume minimum — seuil très bas pour ne pas bloquer les rebonds
+                vol_min = 0.7  # 70% du volume moyen suffit
                 if vol_ratio < vol_min:
-                    logger.debug(f"{sym}: vol={vol_ratio:.1f}x < {vol_min}x — skip")
+                    logger.info(f"[{user_id}] {sym}: vol={vol_ratio:.1f}x < {vol_min}x — skip")
                     continue
 
                 # RSI — zone selon mode
@@ -666,8 +666,8 @@ class BotEngine:
                         logger.debug(f"{sym}: BULL RSI={rsi:.1f} hors 28-72 — skip")
                         continue
                 else:
-                    if not (30 <= rsi <= 70):
-                        logger.debug(f"{sym}: NEUTRAL RSI={rsi:.1f} hors 30-70 — skip")
+                    if not (25 <= rsi <= 75):
+                        logger.info(f"[{user_id}] {sym}: NEUTRAL RSI={rsi:.1f} hors 25-75 — skip")
                         continue
 
                 # MACD requis seulement en BULL
