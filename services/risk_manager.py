@@ -9,7 +9,7 @@ MAX_DAILY_LOSS_PCT     = 3.0    # 3% perte max par jour
 MIN_CONFIDENCE         = 0.65   # 65% min — signaux haute qualité uniquement
 MIN_USDT               = 5.50   # min notional Binance + marge
 MIN_ACCOUNT_USDT       = 6.0    # arrêt complet si capital < 6 USDT
-CIRCUIT_BREAKER_LOSSES = 3      # pause après 3 pertes consécutives
+CIRCUIT_BREAKER_LOSSES = 6      # pause après 6 pertes consécutives
 MAX_ATR_RATIO          = 3.0    # volatilité max réduite
 KELLY_FRACTION         = 0.20   # Kelly conservateur
 
