@@ -43,11 +43,11 @@ SCALP_SL_PCT       = 0.30
 SCALP_TP_PCT       = 0.8
 
 # ── Filtres BULL market (BTC > EMA21) ────────────────────────────────────────
-MIN_CONFIDENCE_BULL      = 0.62   # 62% confiance
-MIN_COMPOSITE_SCORE_BULL = 3.8    # score×conf ≥ 3.8 (ex: score6×conf0.65=3.9 ✓)
-MIN_SCORE_RAW_BULL       = 5      # 5/15 points minimum
-MIN_ADX_BULL             = 12     # tendance légère acceptable en 5m
-MIN_VOLUME_RATIO_BULL    = 1.3    # volume 1.3x la moyenne
+MIN_CONFIDENCE_BULL      = 0.60   # 60% confiance
+MIN_COMPOSITE_SCORE_BULL = 3.0    # score×conf ≥ 3.0
+MIN_SCORE_RAW_BULL       = 4      # 4/15 points minimum (ARBUSDT score=4 passe)
+MIN_ADX_BULL             = 8      # ADX souple en 5m (UNI 10.4, APT 11.8 passent)
+MIN_VOLUME_RATIO_BULL    = 1.2    # volume 1.2x la moyenne
 
 # ── Filtres BEAR market (BTC < EMA21) — rebonds oversold uniquement ──────────
 MIN_CONFIDENCE_BEAR      = 0.65   # 65% confiance
