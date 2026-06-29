@@ -4,7 +4,7 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-MAX_DRAWDOWN_PCT       = 10.0   # 10% max drawdown (conservateur micro-compte)
+MAX_DRAWDOWN_PCT       = 25.0   # 25% max drawdown (capital rechargé, reset effectif)
 MAX_DAILY_LOSS_PCT     = 3.0    # 3% perte max par jour
 MIN_CONFIDENCE         = 0.65   # 65% min — signaux haute qualité uniquement
 MIN_USDT               = 5.50   # min notional Binance + marge
