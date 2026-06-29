@@ -43,19 +43,19 @@ SCALP_SL_PCT       = 0.30
 SCALP_TP_PCT       = 0.8
 
 # ── Filtres BULL market (BTC > EMA21) ────────────────────────────────────────
-MIN_CONFIDENCE_BULL      = 0.60   # 60% confiance
-MIN_COMPOSITE_SCORE_BULL = 3.0    # score×conf ≥ 3.0
-MIN_SCORE_RAW_BULL       = 4      # 4/15 points minimum (ARBUSDT score=4 passe)
-MIN_ADX_BULL             = 8      # ADX souple en 5m (UNI 10.4, APT 11.8 passent)
-MIN_VOLUME_RATIO_BULL    = 1.2    # volume 1.2x la moyenne
+MIN_CONFIDENCE_BULL      = 0.58   # 58% confiance
+MIN_COMPOSITE_SCORE_BULL = 2.5    # score×conf ≥ 2.5
+MIN_SCORE_RAW_BULL       = 4      # 4/15 points minimum
+MIN_ADX_BULL             = 8      # ADX souple en 5m
+MIN_VOLUME_RATIO_BULL    = 1.1    # volume 1.1x la moyenne
 
 # ── Filtres BEAR market (BTC < EMA21) — rebonds oversold uniquement ──────────
-MIN_CONFIDENCE_BEAR      = 0.65   # 65% confiance
-MIN_COMPOSITE_SCORE_BEAR = 4.2    # légèrement plus strict
-MIN_SCORE_RAW_BEAR       = 6      # 6/15 minimum en bear
-MIN_ADX_BEAR             = 10     # ADX très souple en bear
-MIN_VOLUME_RATIO_BEAR    = 1.8    # volume fort requis pour rebond
-RSI_OVERSOLD_BEAR        = 55     # RSI < 55 (assez large pour capturer rebonds)
+MIN_CONFIDENCE_BEAR      = 0.60   # 60% confiance
+MIN_COMPOSITE_SCORE_BEAR = 3.5    # score×conf ≥ 3.5
+MIN_SCORE_RAW_BEAR       = 5      # 5/15 minimum en bear (LTCUSDT score=5 passe)
+MIN_ADX_BEAR             = 8      # ADX très souple
+MIN_VOLUME_RATIO_BEAR    = 1.1    # volume 1.1x seulement (bear = volumes faibles)
+RSI_OVERSOLD_BEAR        = 55     # RSI < 55
 
 # Aliases (compatibilité)
 MIN_CONFIDENCE      = MIN_CONFIDENCE_BULL
