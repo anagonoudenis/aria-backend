@@ -279,22 +279,25 @@ class BotEngine:
             return
 
         # Seuils selon mode marché
+        is_btd = best.get("buy_the_dip", False)   # signal buy-the-dip ?
+
         if market_mode == "BULL":
             min_conf  = MIN_CONFIDENCE_BULL
             min_score = MIN_COMPOSITE_SCORE_BULL
         elif market_mode == "BEAR":
             min_conf  = MIN_CONFIDENCE_BEAR
             min_score = MIN_COMPOSITE_SCORE_BEAR
-            # En bear : vérifier RSI oversold extrême sur la paire
-            rsi = indicators.get("momentum", {}).get("rsi", 50)
-            if rsi > RSI_OVERSOLD_BEAR:
-                logger.info(f"[{user_id}] BEAR mode: RSI {rsi:.1f} > {RSI_OVERSOLD_BEAR} — trade refuse (pas assez oversold)")
-                bot_info["cycles_count"] += 1
-                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-                return
+            # RSI check seulement pour les signaux BUY classiques (pas buy_the_dip)
+            if not is_btd:
+                rsi_chk = indicators.get("momentum", {}).get("rsi", 50)
+                if rsi_chk > RSI_OVERSOLD_BEAR:
+                    logger.info(f"[{user_id}] BEAR RSI {rsi_chk:.1f} > {RSI_OVERSOLD_BEAR} — refuse (oversold requis)")
+                    bot_info["cycles_count"] += 1
+                    bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+                    return
         else:  # NEUTRAL
-            min_conf  = (MIN_CONFIDENCE_BULL + MIN_CONFIDENCE_BEAR) / 2
-            min_score = (MIN_COMPOSITE_SCORE_BULL + MIN_COMPOSITE_SCORE_BEAR) / 2
+            min_conf  = MIN_CONFIDENCE_BEAR   # utiliser seuils BEAR (conservative)
+            min_score = MIN_COMPOSITE_SCORE_BEAR
 
         if signal_data["confidence"] < min_conf:
             logger.info(
@@ -314,35 +317,24 @@ class BotEngine:
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # ── 8b. Filtre régime de marché — refuse uniquement les cas extrêmes ─
+        # ── 8b. Filtres régime — assouplis pour buy_the_dip ──────────────────
         market_regime = signal_data.get("market_regime", "RANGING")
         tf_alignment  = signal_data.get("timeframe_alignment", "MODERATE")
 
-        # Bloquer seulement les tendances baissières fortes en mode BEAR
-        if market_mode == "BEAR" and market_regime == "TRENDING_DOWN":
-            logger.info(f"[{user_id}] BEAR+TRENDING_DOWN — trade refuse")
+        # TRENDING_DOWN bloqué seulement si pas un buy_the_dip
+        # (buy_the_dip entre précisément dans une tendance baissière pour un rebond)
+        if market_regime == "TRENDING_DOWN" and not is_btd:
+            logger.info(f"[{user_id}] TRENDING_DOWN sans BTD — trade refuse")
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # Alignement WEAK toléré en BULL, bloqué en BEAR
-        if tf_alignment == "WEAK" and market_mode != "BULL":
-            logger.info(f"[{user_id}] Alignement WEAK en mode {market_mode} — trade refuse")
+        # WEAK alignment accepté pour buy_the_dip (par définition le 5m est baissier)
+        if tf_alignment == "WEAK" and not is_btd and market_mode == "BEAR":
+            logger.info(f"[{user_id}] WEAK alignment en BEAR sans BTD — trade refuse")
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
-
-        # En marché volatile ou en range : exiger un score plus élevé
-        if market_regime in ("VOLATILE", "RANGING"):
-            required_score = MIN_COMPOSITE_SCORE * 1.25  # +25% de seuil
-            if best["composite_score"] < required_score:
-                logger.info(
-                    f"[{user_id}] Regime {market_regime}: score {best['composite_score']:.1f} "
-                    f"< {required_score:.1f} — trade refuse"
-                )
-                bot_info["cycles_count"] += 1
-                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-                return
 
         # ── 9. Validation risk manager ────────────────────────────────────────
         is_valid, reason = risk_manager.validate_trade(
@@ -623,22 +615,21 @@ class BotEngine:
             effective_action = action_5m
             effective_score  = score_5m
 
-            if market_mode == "BEAR":
-                # Cas 1 : RSI extrêmement oversold (< 28) → achat rebond forcé
-                extreme_oversold = rsi < 28
-                # Cas 2 : buy-the-dip — 5m baissier + AU MOINS UN TF sup haussier
-                btd = (action_5m in ("SELL", "HOLD") and
-                       (action_15m == "BUY" or action_1h == "BUY") and
-                       rsi < 55)
+            # RSI oversold extrême → rebond forcé (tous modes)
+            if rsi < 28:
+                effective_action = "BUY"
+                effective_score  = max(score_5m, 6)
+                logger.info(f"[{user_id}] {sym}: OVERSOLD EXTREME RSI={rsi:.0f} → BUY force")
 
-                if extreme_oversold:
-                    effective_action = "BUY"
-                    effective_score  = max(score_5m, 6)
-                    logger.info(f"[{user_id}] {sym}: OVERSOLD EXTREME RSI={rsi:.0f} → BUY force")
-                elif btd:
+            elif action_5m in ("SELL", "HOLD"):
+                # Buy-the-dip : 5m baissier + au moins 1 TF sup haussier
+                # Actif en BEAR et NEUTRAL, RSI pas trop élevé
+                rsi_max = 55 if market_mode == "BEAR" else 62
+                btd = ((action_15m == "BUY" or action_1h == "BUY") and rsi < rsi_max)
+                if btd:
                     effective_action = "BUY"
                     effective_score  = max(score_5m, score_15m)
-                    logger.info(f"[{user_id}] {sym}: BUY-THE-DIP 5m={action_5m} 15m={action_15m} 1h={action_1h} RSI={rsi:.0f}")
+                    logger.info(f"[{user_id}] {sym}: BUY-THE-DIP({market_mode}) 5m={action_5m} 15m={action_15m} 1h={action_1h} RSI={rsi:.0f}")
 
             # ── Ignorer si pas BUY et pas de position à fermer ───────────
             if effective_action != "BUY" and sym not in open_symbols:
@@ -782,6 +773,7 @@ class BotEngine:
             "signal":          signal_data,
             "indicators":      indicators,
             "composite_score": composite,
+            "buy_the_dip":     best_candidate.get("buy_the_dip", False),
         }
 
     async def _analyze_pair_fast(
