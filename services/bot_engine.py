@@ -675,15 +675,17 @@ class BotEngine:
                     logger.debug(f"{sym}: BULL MACD_h={macd_h:.6f} <= 0 — skip")
                     continue
 
-                # Anti-chasing
-                if len(candles) >= 2:
-                    last_c = candles[-1]
-                    prev_c = candles[-2]
-                    if prev_c.get("close", 0) > 0:
-                        last_move = (last_c.get("close",0) - prev_c.get("close",0)) / prev_c.get("close",0) * 100
-                        if last_move > 1.5:
-                            logger.debug(f"{sym}: chasing +{last_move:.2f}% — skip")
-                            continue
+                # Anti-chasing — désactivé pour buy_the_dip (on veut les rebonds)
+                # Actif uniquement pour les signaux BUY classiques (5m=BUY)
+                if effective_action == "BUY" and action_5m == "BUY":
+                    if len(candles) >= 2:
+                        last_c = candles[-1]
+                        prev_c = candles[-2]
+                        if prev_c.get("close", 0) > 0:
+                            last_move = (last_c.get("close",0) - prev_c.get("close",0)) / prev_c.get("close",0) * 100
+                            if last_move > 2.0:
+                                logger.info(f"[{user_id}] {sym}: chasing +{last_move:.2f}% — skip")
+                                continue
 
                 # EMA requis seulement en BULL
                 if market_mode == "BULL":
