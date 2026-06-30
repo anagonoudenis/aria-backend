@@ -180,7 +180,7 @@ class BotEngine:
 
         if bot_info.get("circuit_breaker_active"):
             since = bot_info.get("circuit_breaker_since")
-            if since and (datetime.now(timezone.utc) - since).total_seconds() >= 4 * 3600:
+            if not since or (datetime.now(timezone.utc) - since).total_seconds() >= 4 * 3600:
                 bot_info["circuit_breaker_active"] = False
                 bot_info["circuit_breaker_reason"]  = None
                 bot_info["consecutive_losses"]      = 0
