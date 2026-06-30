@@ -94,6 +94,7 @@ class BotEngine:
             "consecutive_losses": 0,
             "circuit_breaker_active": False,
             "circuit_breaker_reason": None,
+            "cb_last_reset_at": datetime.now(timezone.utc),
             "scan_results": {},
             "sl_cooldown": {},          # {symbol: datetime} — paires en cooldown après SL
             "pending_entry": None,     # signal en attente d'un pullback vers EMA9
@@ -184,6 +185,7 @@ class BotEngine:
                 bot_info["circuit_breaker_active"] = False
                 bot_info["circuit_breaker_reason"]  = None
                 bot_info["consecutive_losses"]      = 0
+                bot_info["cb_last_reset_at"]        = datetime.now(timezone.utc)
                 logger.info(f"[{user_id}] Circuit breaker reset automatique (4h ecoulees)")
             else:
                 logger.warning(f"[{user_id}] Circuit breaker actif — cycle ignore")
@@ -244,9 +246,12 @@ class BotEngine:
             return
 
         # ── 4. Circuit breaker — arrêt après MAX pertes consécutives ─────────
-        recent_trades = await db.trades.find(
-            {"user_id": user_id, "status": "CLOSED"}
-        ).sort("created_at", -1).limit(50).to_list(50)
+        cb_reset_at = bot_info.get("cb_last_reset_at")
+        cb_query = {"user_id": user_id, "status": "CLOSED"}
+        if cb_reset_at:
+            cb_query["created_at"] = {"$gt": cb_reset_at}
+
+        recent_trades = await db.trades.find(cb_query).sort("created_at", -1).limit(50).to_list(50)
 
         consecutive = risk_manager.count_consecutive_losses(recent_trades)
         bot_info["consecutive_losses"] = consecutive
