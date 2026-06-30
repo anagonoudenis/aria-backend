@@ -15,7 +15,9 @@ KELLY_FRACTION         = 0.20   # Kelly conservateur
 
 CORRELATED_PAIRS = [
     {"BTCUSDT", "ETHUSDT"},
-    {"BNBUSDT", "SOLUSDT"},
+    {"DOGEUSDT", "SHIBUSDT"},                                              # memecoins — quasi-identiques
+    {"ARBUSDT", "OPUSDT"},                                                 # L2 scaling — forte corrélation
+    {"SOLUSDT", "AVAXUSDT", "NEARUSDT", "ATOMUSDT", "APTUSDT", "SUIUSDT", "INJUSDT"},  # L1 alternatifs
 ]
 
 
@@ -58,6 +60,16 @@ class RiskManager:
         max_open = bot_config.get("max_open_trades", 1)
         if open_trades_count >= max_open:
             return False, f"Position deja ouverte ({open_trades_count}/{max_open})"
+
+        # Bloquer une 2e position sur une paire corrélée déjà ouverte
+        # (évite de doubler l'exposition à un même mouvement de marché)
+        symbol = signal.get("symbol", "")
+        if open_trade_symbols:
+            for pair_set in CORRELATED_PAIRS:
+                if symbol in pair_set:
+                    for open_sym in open_trade_symbols:
+                        if open_sym != symbol and open_sym in pair_set:
+                            return False, f"Paire corrélée déjà ouverte: {open_sym} (groupe {pair_set})"
 
         if consecutive_losses >= CIRCUIT_BREAKER_LOSSES:
             return False, f"Circuit breaker: {consecutive_losses} pertes consecutives"

@@ -70,6 +70,9 @@ DAILY_MAX_LOSS_PCT        = 3.0     # stoppe si perte journalière > 3% (était 
 
 _active_cycles: set = set()
 
+# Cache paires à fort momentum (rafraîchi toutes les 15 min)
+_hot_pairs_cache: Dict[str, Any] = {"pairs": [], "last_update": None}
+
 
 class BotEngine:
     def __init__(self):
@@ -183,10 +186,12 @@ class BotEngine:
             logger.warning(f"[{user_id}] Circuit breaker actif — cycle ignore")
             return
 
-        # ── 0. Filtre horaire — seulement les 2h les plus creuses (3h-5h UTC) ──
+        # ── 0. Filtre horaire — zone morte crypto (3h-6h UTC, liquidité très faible) ──
         utc_hour = datetime.now(timezone.utc).hour
-        if 3 <= utc_hour < 5:
-            logger.info(f"[{user_id}] Heure creuse ({utc_hour}h UTC) — cycle skip")
+        if 3 <= utc_hour < 6:
+            logger.info(f"[{user_id}] Zone morte ({utc_hour}h UTC) — cycle skip")
+            bot_info["cycles_count"] += 1
+            bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
         # ── 1. Gérer les positions ouvertes AVANT d'ouvrir de nouvelles ─────
@@ -414,6 +419,21 @@ class BotEngine:
             tp_pct = round(sl_pct * 2.5, 3)
             logger.info(f"[{user_id}] R:R ajusté → SL={sl_pct}% TP={tp_pct}% (2.5:1 garanti)")
 
+        # TP étendu pour setups de très haute qualité (BB Squeeze + ADX fort + triple bull)
+        _bb_sq = indicators.get("volatility", {}).get("bb_squeeze", False)
+        _bb_ex = indicators.get("volatility", {}).get("bb_expanding", False)
+        _adx_v = indicators.get("trend", {}).get("adx", 0)
+        _adx_r = indicators.get("trend", {}).get("adx_rising", False)
+        _triple = best.get("triple_bull", False) if best else False
+        if _bb_sq and _bb_ex and _adx_v > 25 and _triple:
+            extended_tp = round(sl_pct * 3.5, 3)
+            if extended_tp > tp_pct:
+                logger.info(
+                    f"[{user_id}] TP étendu setup premium "
+                    f"BB-Squeeze+ADX{_adx_v:.0f}+TripleBull: {tp_pct}% → {extended_tp}%"
+                )
+                tp_pct = extended_tp
+
         # ── 11. Kelly position sizing avec réduction après pertes ────────────
         base_usdt    = (available_usdt / max_positions) * 0.90
         win_rate_pct = portfolio_data.get("win_rate", 0)
@@ -435,9 +455,28 @@ class BotEngine:
             position_usdt = position_usdt * 0.7  # 70% après 2 pertes
         position_usdt = max(position_usdt, 5.50)
         position_usdt = min(position_usdt, available_usdt * 0.90)
+
+        # Multiplicateur qualité setup : BB Squeeze ou ADX fort → position plus grande
+        bb_squeeze_now  = indicators.get("volatility", {}).get("bb_squeeze", False)
+        bb_expanding_now = indicators.get("volatility", {}).get("bb_expanding", False)
+        adx_now_val     = indicators.get("trend", {}).get("adx", 0)
+        adx_rising_now  = indicators.get("trend", {}).get("adx_rising", False)
+        conf_now        = signal_data.get("confidence", 0)
+
+        quality_label = ""
+        if bb_squeeze_now and bb_expanding_now:
+            position_usdt = min(position_usdt * 1.25, available_usdt * 0.92)
+            quality_label = " [BB-SQUEEZE ×1.25]"
+        elif adx_now_val > 30 and adx_rising_now:
+            position_usdt = min(position_usdt * 1.15, available_usdt * 0.92)
+            quality_label = " [ADX-FORT ×1.15]"
+        elif conf_now >= 0.82:
+            position_usdt = min(position_usdt * 1.10, available_usdt * 0.92)
+            quality_label = " [CONF-HAUTE ×1.10]"
+
         logger.info(
             f"[{user_id}] Position: {position_usdt:.2f} USDT "
-            f"(WR={win_rate_pct:.0f}% kelly_mult={kelly_mult:.2f} consec_losses={consecutive})"
+            f"(WR={win_rate_pct:.0f}% kelly_mult={kelly_mult:.2f} consec_losses={consecutive}){quality_label}"
         )
 
         # ── 12. Pullback entry — attendre EMA9 si prix trop haut ─────────────
@@ -613,6 +652,33 @@ class BotEngine:
     # SCAN MULTI-PAIRES
     # ══════════════════════════════════════════════════════════════════════════
 
+    async def _get_hot_pairs(self) -> List[str]:
+        """Retourne les paires avec fort momentum du moment (rafraîchi toutes les 15 min)."""
+        now = datetime.now(timezone.utc)
+        cache = _hot_pairs_cache
+        last = cache.get("last_update")
+        if last is None or (now - last).total_seconds() > 900:
+            try:
+                all_pairs = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: binance_service.get_top_pairs(min_volume_usdt=10_000_000)
+                )
+                # Paires à forte variation + volume élevé + pas déjà dans SCAN_PAIRS
+                scan_set = set(SCAN_PAIRS)
+                hot = [
+                    p["symbol"] for p in all_pairs[:100]
+                    if p["symbol"] not in scan_set
+                    and abs(p.get("change_pct", 0)) > 2.5
+                    and p.get("volume_usdt", 0) > 20_000_000
+                    and p["symbol"].endswith("USDT")
+                ][:6]
+                cache["pairs"] = hot
+                cache["last_update"] = now
+                if hot:
+                    logger.info(f"Hot pairs 15m: {hot}")
+            except Exception as e:
+                logger.debug(f"Hot pairs fetch error: {e}")
+        return cache.get("pairs", [])
+
     async def _scan_best_opportunity(
         self, user_id: str,
         symbols: List[str],
@@ -628,11 +694,15 @@ class BotEngine:
         """
         available = (portfolio_data or {}).get("available_usdt", 0.0)
 
+        # Ajouter les paires à fort momentum du moment
+        hot_pairs = await self._get_hot_pairs()
+        effective_symbols = list(dict.fromkeys(list(symbols) + hot_pairs))  # déduplique, ordre stable
+
         # Cooldown : paires ayant récemment déclenché un SL
         now = datetime.now(timezone.utc)
         sl_cooldown = self._running_bots.get(user_id, {}).get("sl_cooldown", {})
         candidates = [
-            s for s in symbols
+            s for s in effective_symbols
             if s not in open_symbols
             and (s not in HIGH_NOTIONAL_PAIRS or available >= 15.0)
             and (
@@ -652,16 +722,21 @@ class BotEngine:
             if isinstance(result, Exception) or result is None:
                 continue
 
-            # Unpack 4-tuple (rétrocompatible si 1h manque)
-            if len(result) == 4:
+            # Unpack 5-tuple (rétrocompatible si 4h/1h manquent)
+            if len(result) == 5:
+                indicators_5m, rule_sig_5m, rule_sig_15m, rule_sig_1h, rule_sig_4h = result
+            elif len(result) == 4:
                 indicators_5m, rule_sig_5m, rule_sig_15m, rule_sig_1h = result
+                rule_sig_4h = {}
             else:
                 indicators_5m, rule_sig_5m, rule_sig_15m = result
                 rule_sig_1h = {}
+                rule_sig_4h = {}
 
             action_5m  = rule_sig_5m.get("action", "HOLD")
             action_15m = rule_sig_15m.get("action", "HOLD")
             action_1h  = rule_sig_1h.get("action", "HOLD")
+            action_4h  = rule_sig_4h.get("action", "HOLD")
             score_5m   = rule_sig_5m.get("score", 0)
             score_15m  = rule_sig_15m.get("score", 0)
 
@@ -774,6 +849,18 @@ class BotEngine:
                     logger.info(f"[{user_id}] {sym}: 5m BUY mais 15m+1h SELL — faux breakout possible, skip")
                     continue
 
+                # Anti-pump : éviter les entrées tardives (prix +7% sur 1h)
+                if len(candles) >= 12:
+                    price_1h_ago = candles[-12].get("close", 0)
+                    if price_1h_ago > 0:
+                        move_1h = (candles[-1]["close"] - price_1h_ago) / price_1h_ago * 100
+                        if move_1h > 7.0:
+                            logger.info(f"[{user_id}] {sym}: pump +{move_1h:.1f}% (1h) — entrée tardive, skip")
+                            continue
+                        if move_1h < -8.0:
+                            logger.info(f"[{user_id}] {sym}: dump {move_1h:.1f}% (1h) — skip BUY")
+                            continue
+
             # ── Confluence multiplier ─────────────────────────────────────
             triple = (action_15m == "BUY" and action_1h == "BUY")
             double = (action_15m == "BUY" or action_1h  == "BUY")
@@ -786,6 +873,14 @@ class BotEngine:
             else:
                 confluence_mult = 1.0
 
+            # 4h macro trend boost / malus
+            if action_4h == "BUY":
+                confluence_mult = round(confluence_mult * 1.15, 3)
+                logger.debug(f"{sym}: 4h BUY — confluence ×1.15")
+            elif action_4h == "SELL" and rsi > 38:
+                confluence_mult = round(confluence_mult * 0.85, 3)
+                logger.debug(f"{sym}: 4h SELL — confluence ×0.85 (RSI={rsi:.0f})")
+
             score = round(effective_score * confluence_mult, 1)
 
             scored.append({
@@ -796,6 +891,7 @@ class BotEngine:
                 "rule_sig":       rule_sig_5m,
                 "confluence_15m": action_15m,
                 "confluence_1h":  action_1h,
+                "confluence_4h":  action_4h,
                 "triple_bull":    (action_5m == "BUY" and triple),
                 "buy_the_dip":    (effective_action == "BUY" and action_5m != "BUY"),
             })
@@ -816,7 +912,7 @@ class BotEngine:
         logger.info(
             f"[{user_id}] Best: {sym} score={best_candidate['score']:.1f} "
             f"5m={best_candidate['action']} 15m={best_candidate['confluence_15m']} "
-            f"1h={best_candidate.get('confluence_1h','?')} {tag}"
+            f"1h={best_candidate.get('confluence_1h','?')} 4h={best_candidate.get('confluence_4h','?')} {tag}"
         )
 
         try:
@@ -856,8 +952,8 @@ class BotEngine:
 
     async def _analyze_pair_fast(
         self, symbol: str
-    ) -> Optional[Tuple[Dict, Dict, Dict, Dict]]:
-        """Triple timeframe : 5m + 15m + 1h. Retourne (ind_5m, sig_5m, sig_15m, sig_1h)."""
+    ) -> Optional[Tuple[Dict, Dict, Dict, Dict, Dict]]:
+        """Quad timeframe : 5m + 15m + 1h + 4h. Retourne (ind_5m, sig_5m, sig_15m, sig_1h, sig_4h)."""
         try:
             # ── 5m ───────────────────────────────────────────────────────────
             key_5m = f"klines:{symbol}:5m"
@@ -918,7 +1014,28 @@ class BotEngine:
             except Exception as e1h:
                 logger.debug(f"1h {symbol} failed (non bloquant): {e1h}")
 
-            return ind_5m, rule_5m, rule_15m, rule_1h
+            # ── 4h (macro trend) ──────────────────────────────────────────
+            rule_4h: Dict = {}
+            try:
+                key_4h = f"klines:{symbol}:4h"
+                df_4h = cache.get(key_4h)
+                if df_4h is None:
+                    df_4h = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: binance_service.get_klines(symbol, "4h", limit=50)
+                    )
+                    cache.set(key_4h, df_4h, ttl_seconds=KLINE_TTL.get("4h", 14400))
+
+                ind_key_4h = f"indicators:{symbol}:4h"
+                ind_4h = cache.get(ind_key_4h)
+                if ind_4h is None:
+                    ind_4h = analysis_service.compute_indicators(df_4h, symbol=symbol)
+                    cache.set(ind_key_4h, ind_4h, ttl_seconds=INDICATOR_TTL.get("4h", 14400))
+
+                rule_4h = ind_4h.get("rule_signal", {})
+            except Exception as e4h:
+                logger.debug(f"4h {symbol} failed (non bloquant): {e4h}")
+
+            return ind_5m, rule_5m, rule_15m, rule_1h, rule_4h
 
         except Exception as e:
             logger.debug(f"Fast analysis {symbol} failed: {e}")
@@ -964,9 +1081,16 @@ class BotEngine:
 
         pnl_pct = (price - entry) / entry * 100
 
-        # Trailing step adaptatif selon ADX enregistré à l'entrée
+        # Trailing step adaptatif : plus serré quand on est bien en profit (lock gains)
         adx_entry  = float(trade.get("signal_adx", 0) or 0)
-        trail_step = 0.3 if adx_entry > 35 else TRAIL_STEP_PCT  # plus serré si forte tendance
+        if pnl_pct >= 2.0:
+            trail_step = 0.20   # > +2% : trail très serré — protège presque tout
+        elif pnl_pct >= 1.5:
+            trail_step = 0.25   # > +1.5% : trail serré
+        elif adx_entry > 35:
+            trail_step = 0.30   # tendance forte à l'entrée
+        else:
+            trail_step = TRAIL_STEP_PCT  # 0.35% par défaut
 
         # Mettre à jour le plus haut
         updates = {}
@@ -1021,6 +1145,17 @@ class BotEngine:
         indicators: Optional[Dict] = None,
     ) -> None:
         """Place un ordre BUY et sauvegarde le trade."""
+        # Garde-fou spread — évite les achats en marché illiquide (mauvais prix d'exécution)
+        try:
+            spread_pct = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: binance_service.get_spread_pct(symbol)
+            )
+            if spread_pct > 0.25:
+                logger.warning(f"[{user_id}] {symbol}: spread {spread_pct:.3f}% trop large — achat annulé")
+                return
+        except Exception as e_spread:
+            logger.debug(f"Spread check {symbol} non bloquant: {e_spread}")
+
         try:
             qty = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: binance_service.calculate_quantity(symbol, position_usdt, current_price)
@@ -1041,6 +1176,21 @@ class BotEngine:
 
         tp_price = ex_price * (1 + tp_pct / 100)
         sl_price = ex_price * (1 - sl_pct / 100)
+
+        # Ajustement TP selon résistance proche — éviter de se faire rejeter
+        if indicators:
+            resistance = indicators.get("levels", {}).get("resistance", 0)
+            if resistance > ex_price * 1.005:
+                dist_res_pct = (resistance - ex_price) / ex_price * 100
+                if dist_res_pct < tp_pct:
+                    # Résistance avant le TP → viser juste en dessous
+                    adj_tp_pct = max(dist_res_pct * 0.90, sl_pct * 2.2)
+                    if adj_tp_pct < tp_pct:
+                        tp_price = ex_price * (1 + adj_tp_pct / 100)
+                        logger.info(
+                            f"[{user_id}] TP ajusté sous résistance {resistance:.4f}: "
+                            f"{tp_pct:.2f}% → {adj_tp_pct:.2f}%"
+                        )
 
         trade = TradeInDB(
             user_id=user_id, symbol=symbol, side=TradeSide("BUY"),

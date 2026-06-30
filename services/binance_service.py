@@ -66,6 +66,19 @@ class BinanceService:
             logger.error(f"Binance API error getting price for {symbol}: {e.message}")
             raise
 
+    def get_spread_pct(self, symbol: str) -> float:
+        """Spread bid-ask en % du prix — évite les achats en marché illiquide."""
+        try:
+            book = self._client.get_orderbook_ticker(symbol=symbol)
+            bid = float(book["bidPrice"])
+            ask = float(book["askPrice"])
+            if bid <= 0:
+                return 0.0
+            return (ask - bid) / bid * 100
+        except BinanceAPIException as e:
+            logger.warning(f"Spread check failed for {symbol}: {e.message}")
+            return 0.0
+
     def get_account_balance(self) -> Dict[str, Any]:
         try:
             account = self._client.get_account()
