@@ -37,10 +37,6 @@ BREAKEVEN_PCT      = 0.5
 STOP_LOSS_PCT      = 0.9   # SL défaut légèrement plus large (évite faux triggers)
 TAKE_PROFIT_PCT    = 2.5   # TP défaut — ratio 2.8:1
 
-# Scalping haute confiance — TP rapide, SL serré
-SCALP_CONFIDENCE   = 0.82
-SCALP_SL_PCT       = 0.40
-SCALP_TP_PCT       = 1.2
 
 # ── Filtres BULL market (BTC > EMA21) ────────────────────────────────────────
 MIN_CONFIDENCE_BULL      = 0.65   # 65% — aligné sur risk_manager
@@ -183,8 +179,15 @@ class BotEngine:
         config   = bot_info["config"]
 
         if bot_info.get("circuit_breaker_active"):
-            logger.warning(f"[{user_id}] Circuit breaker actif — cycle ignore")
-            return
+            since = bot_info.get("circuit_breaker_since")
+            if since and (datetime.now(timezone.utc) - since).total_seconds() >= 4 * 3600:
+                bot_info["circuit_breaker_active"] = False
+                bot_info["circuit_breaker_reason"]  = None
+                bot_info["consecutive_losses"]      = 0
+                logger.info(f"[{user_id}] Circuit breaker reset automatique (4h ecoulees)")
+            else:
+                logger.warning(f"[{user_id}] Circuit breaker actif — cycle ignore")
+                return
 
         # ── 0. Filtre horaire — zone morte crypto (3h-6h UTC, liquidité très faible) ──
         utc_hour = datetime.now(timezone.utc).hour
@@ -263,6 +266,7 @@ class BotEngine:
             reason = f"Circuit breaker: {consecutive} pertes consécutives"
             bot_info["circuit_breaker_active"] = True
             bot_info["circuit_breaker_reason"]  = reason
+            bot_info["circuit_breaker_since"]   = datetime.now(timezone.utc)
             await notification_service.send(user_id, "circuit_breaker", {"reason": reason})
             logger.warning(f"[{user_id}] {reason}")
             bot_info["cycles_count"] += 1
@@ -394,25 +398,20 @@ class BotEngine:
 
         # ── 10. SL/TP — ratio 3:1 garanti ────────────────────────────────────
         conf = signal_data["confidence"]
-        if conf >= SCALP_CONFIDENCE:
-            sl_pct = SCALP_SL_PCT   # 0.35%
-            tp_pct = SCALP_TP_PCT   # 1.0%
-            logger.info(f"[{user_id}] Mode SCALPING ({conf:.0%}): SL={sl_pct}% TP={tp_pct}%")
+        atr = indicators.get("volatility", {}).get("atr", 0)
+        if atr > 0 and current_price > 0:
+            raw_sl = (1.0 * atr / current_price) * 100
+            raw_tp = (3.0 * atr / current_price) * 100
+            # SL [0.7%-1.5%] — plus large pour absorber le bruit 5m, TP [2.0%-5.0%]
+            sl_pct = round(max(min(raw_sl, 1.5), 0.7), 3)
+            tp_pct = round(max(min(raw_tp, 5.0), max(2.0, sl_pct * 2.8)), 3)
+            logger.info(
+                f"[{user_id}] ATR SL={sl_pct}% TP={tp_pct}% ratio={tp_pct/sl_pct:.1f}:1 conf={conf:.0%}"
+            )
         else:
-            atr = indicators.get("volatility", {}).get("atr", 0)
-            if atr > 0 and current_price > 0:
-                raw_sl = (1.0 * atr / current_price) * 100
-                raw_tp = (3.0 * atr / current_price) * 100
-                # Bornes SL [0.7%-1.2%], TP [2.0%-4.5%] — ratio min 2.8:1
-                sl_pct = round(max(min(raw_sl, 1.2), 0.7), 3)
-                tp_pct = round(max(min(raw_tp, 4.5), max(2.0, sl_pct * 2.8)), 3)
-                logger.info(
-                    f"[{user_id}] ATR SL={sl_pct}% TP={tp_pct}% ratio={tp_pct/sl_pct:.1f}:1"
-                )
-            else:
-                sl_pct = STOP_LOSS_PCT    # 0.9%
-                tp_pct = TAKE_PROFIT_PCT  # 2.5%
-                logger.info(f"[{user_id}] Default SL={sl_pct}% TP={tp_pct}%")
+            sl_pct = STOP_LOSS_PCT    # 0.9%
+            tp_pct = TAKE_PROFIT_PCT  # 2.5%
+            logger.info(f"[{user_id}] Default SL={sl_pct}% TP={tp_pct}%")
 
         # Vérification R:R minimal (sécurité absolue)
         if tp_pct / sl_pct < 2.2:
@@ -746,7 +745,7 @@ class BotEngine:
             candles    = indicators_5m.get("candles_summary", [])
             rsi        = momentum.get("rsi", 50)
             adx        = trend_5m.get("adx", 0)
-            vol_ratio  = volume_ind.get("volume_ratio", 1.0)
+            vol_ratio  = volume_ind.get("vol_ratio", 1.0)
             macd_h     = trend_5m.get("macd_histogram", 0)
 
             # ── Déterminer le signal effectif ────────────────────────────
@@ -793,8 +792,8 @@ class BotEngine:
                     logger.info(f"[{user_id}] {sym}: ADX={adx:.1f} < {adx_min} ({market_mode}) — skip")
                     continue
 
-                # Volume minimum — 1.3x en BULL, 0.8x en BEAR/NEUTRAL
-                vol_min = 1.3 if market_mode == "BULL" else 0.8
+                # Volume minimum — spike réel requis pour confirmer le mouvement
+                vol_min = 1.5 if market_mode == "BULL" else 1.2
                 if vol_ratio < vol_min:
                     logger.info(f"[{user_id}] {sym}: vol={vol_ratio:.1f}x < {vol_min}x ({market_mode}) — skip")
                     continue
@@ -843,10 +842,10 @@ class BotEngine:
                     logger.debug(f"{sym}: triple SELL — skip")
                     continue
 
-                # Normal BUY (5m = BUY) : exiger au moins un TF supérieur haussier
-                # Évite les faux breakouts contre le trend 15m+1h
-                if action_5m == "BUY" and action_15m == "SELL" and action_1h == "SELL":
-                    logger.info(f"[{user_id}] {sym}: 5m BUY mais 15m+1h SELL — faux breakout possible, skip")
+                # 15m confirmation bloquante — si 15m dit SELL, on n'achète pas sur 5m
+                # La 15m est 3x plus fiable que la 5m pour la direction
+                if action_5m == "BUY" and action_15m == "SELL":
+                    logger.info(f"[{user_id}] {sym}: 5m BUY mais 15m SELL — contre-tendance, skip")
                     continue
 
                 # Anti-pump : éviter les entrées tardives (prix +7% sur 1h)
@@ -860,6 +859,15 @@ class BotEngine:
                         if move_1h < -8.0:
                             logger.info(f"[{user_id}] {sym}: dump {move_1h:.1f}% (1h) — skip BUY")
                             continue
+
+                # Confirmation bougie fermée au-dessus EMA9 — BUY classiques uniquement
+                # (Ne s'applique PAS aux buy_the_dip : par définition le prix est sous EMA9)
+                if action_5m == "BUY":
+                    ema9_chk  = trend_5m.get("ema_9", 0)
+                    close_chk = candles[-1]["close"] if candles else 0
+                    if ema9_chk > 0 and close_chk > 0 and close_chk < ema9_chk * 0.998:
+                        logger.info(f"[{user_id}] {sym}: close {close_chk:.4f} < EMA9 {ema9_chk:.4f} — confirmation échouée, skip")
+                        continue
 
             # ── Confluence multiplier ─────────────────────────────────────
             triple = (action_15m == "BUY" and action_1h == "BUY")

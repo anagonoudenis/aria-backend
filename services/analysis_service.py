@@ -219,8 +219,7 @@ def generate_momentum_signal(indicators: Dict[str, Any], df: pd.DataFrame) -> Di
         # RSI
         if rsi < 25:        buy_pts.append(("RSI tres survendu", 4))
         elif rsi < 38:      buy_pts.append(("RSI survendu", 3))
-        elif rsi < 48:      buy_pts.append(("RSI neutre bas", 2))
-        elif rsi < 55:      buy_pts.append(("RSI leger achat", 1))
+        elif rsi < 45:      buy_pts.append(("RSI neutre bas", 2))
 
         # RSI en remontée confirmée sur 2 bougies (plus fiable qu'une seule)
         rsi_rising_confirmed = rsi > rsi_prev + 0.5 and rsi_prev > rsi_3ago + 0.5
@@ -238,8 +237,9 @@ def generate_momentum_signal(indicators: Dict[str, Any], df: pd.DataFrame) -> Di
         if close > ema9:    buy_pts.append(("Prix>EMA9", 1))
         if trending and ema9 > ema21: buy_pts.append(("EMA9>EMA21", 1))
 
-        # Volume directionnel — ne compte que si la bougie est haussière
-        if vol_r > 1.15 and last_candle_bull: buy_pts.append(("Volume haussier", 1))
+        # Volume directionnel — spike réel requis, bougie haussière
+        if vol_r > 1.5 and last_candle_bull:   buy_pts.append(("Volume haussier fort", 2))
+        elif vol_r > 1.2 and last_candle_bull: buy_pts.append(("Volume haussier", 1))
         if cmf > 0:             buy_pts.append(("CMF positif", 1))
         if obv_sl > 0:          buy_pts.append(("OBV haussier", 1))
 
