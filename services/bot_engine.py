@@ -398,34 +398,46 @@ class BotEngine:
             if atr > 0 and current_price > 0:
                 raw_sl = (1.0 * atr / current_price) * 100
                 raw_tp = (3.0 * atr / current_price) * 100
-                # Bornes : SL [0.5%-1.0%], TP [1.5%-4.0%] ratio min 2.5:1
-                sl_pct = round(max(min(raw_sl, 1.0), 0.5), 3)
-                tp_pct = round(max(min(raw_tp, 4.0), max(1.5, sl_pct * 2.5)), 3)
+                # Bornes SL [0.7%-1.2%], TP [2.0%-4.5%] — ratio min 2.8:1
+                sl_pct = round(max(min(raw_sl, 1.2), 0.7), 3)
+                tp_pct = round(max(min(raw_tp, 4.5), max(2.0, sl_pct * 2.8)), 3)
                 logger.info(
                     f"[{user_id}] ATR SL={sl_pct}% TP={tp_pct}% ratio={tp_pct/sl_pct:.1f}:1"
                 )
             else:
-                sl_pct = STOP_LOSS_PCT   # 0.8%
+                sl_pct = STOP_LOSS_PCT    # 0.9%
                 tp_pct = TAKE_PROFIT_PCT  # 2.5%
                 logger.info(f"[{user_id}] Default SL={sl_pct}% TP={tp_pct}%")
 
-        # ── 11. Kelly position sizing ─────────────────────────────────────────
+        # Vérification R:R minimal (sécurité absolue)
+        if tp_pct / sl_pct < 2.2:
+            tp_pct = round(sl_pct * 2.5, 3)
+            logger.info(f"[{user_id}] R:R ajusté → SL={sl_pct}% TP={tp_pct}% (2.5:1 garanti)")
+
+        # ── 11. Kelly position sizing avec réduction après pertes ────────────
         base_usdt    = (available_usdt / max_positions) * 0.90
         win_rate_pct = portfolio_data.get("win_rate", 0)
         kelly_mult   = 1.0
         if win_rate_pct > 0:
             win_r    = win_rate_pct / 100
-            rr_ratio = tp_pct / sl_pct if sl_pct > 0 else 3.0
+            rr_ratio = tp_pct / sl_pct if sl_pct > 0 else 2.8
             kelly    = win_r - (1 - win_r) / rr_ratio
-            kelly_mult = 1.0 + max(min(kelly * 0.5, 0.5), -0.3)
+            kelly_mult = 1.0 + max(min(kelly * 0.5, 0.4), -0.4)
             position_usdt = base_usdt * kelly_mult
         else:
             position_usdt = base_usdt
+        # Réduire la taille après des pertes consécutives (protection capital)
+        if consecutive >= 3:
+            loss_factor = 0.5  # 50% de la taille normale après 3+ pertes
+            position_usdt = position_usdt * loss_factor
+            logger.info(f"[{user_id}] Taille réduite ×0.5 ({consecutive} pertes consécutives)")
+        elif consecutive >= 2:
+            position_usdt = position_usdt * 0.7  # 70% après 2 pertes
         position_usdt = max(position_usdt, 5.50)
-        position_usdt = min(position_usdt, available_usdt * 0.95)
+        position_usdt = min(position_usdt, available_usdt * 0.90)
         logger.info(
-            f"[{user_id}] Kelly position: {position_usdt:.2f} USDT "
-            f"(WR={win_rate_pct:.0f}% mult={kelly_mult:.2f})"
+            f"[{user_id}] Position: {position_usdt:.2f} USDT "
+            f"(WR={win_rate_pct:.0f}% kelly_mult={kelly_mult:.2f} consec_losses={consecutive})"
         )
 
         # ── 12. Pullback entry — attendre EMA9 si prix trop haut ─────────────
@@ -706,10 +718,10 @@ class BotEngine:
                     logger.info(f"[{user_id}] {sym}: ADX={adx:.1f} < {adx_min} ({market_mode}) — skip")
                     continue
 
-                # Volume minimum — seuil très bas pour ne pas bloquer les rebonds
-                vol_min = 0.7  # 70% du volume moyen suffit
+                # Volume minimum — 1.3x en BULL, 0.8x en BEAR/NEUTRAL
+                vol_min = 1.3 if market_mode == "BULL" else 0.8
                 if vol_ratio < vol_min:
-                    logger.info(f"[{user_id}] {sym}: vol={vol_ratio:.1f}x < {vol_min}x — skip")
+                    logger.info(f"[{user_id}] {sym}: vol={vol_ratio:.1f}x < {vol_min}x ({market_mode}) — skip")
                     continue
 
                 # RSI — zone selon mode
@@ -751,9 +763,15 @@ class BotEngine:
                         logger.debug(f"{sym}: BULL EMA9<EMA21 — skip")
                         continue
 
-                # Bloquer seulement si TOUS les TF sont baissiers
+                # Bloquer si TOUS les TF sont baissiers (triple SELL)
                 if action_5m == "SELL" and action_15m == "SELL" and action_1h == "SELL":
                     logger.debug(f"{sym}: triple SELL — skip")
+                    continue
+
+                # Normal BUY (5m = BUY) : exiger au moins un TF supérieur haussier
+                # Évite les faux breakouts contre le trend 15m+1h
+                if action_5m == "BUY" and action_15m == "SELL" and action_1h == "SELL":
+                    logger.info(f"[{user_id}] {sym}: 5m BUY mais 15m+1h SELL — faux breakout possible, skip")
                     continue
 
             # ── Confluence multiplier ─────────────────────────────────────

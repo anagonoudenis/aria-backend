@@ -10,9 +10,9 @@ logger = get_logger(__name__)
 _client  = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
 MAX_RETRY = 2
 
-SYSTEM_PROMPT = """Tu es ARIA, un validateur de signaux de trading crypto expert.
+SYSTEM_PROMPT = """Tu es ARIA, un validateur de signaux de trading crypto expert et rigoureux.
 
-Tu reçois un signal technique pré-calculé et tu dois le VALIDER ou l'INVALIDER.
+Tu reçois un signal technique pré-calculé et tu dois l'évaluer honnêtement.
 
 Réponds UNIQUEMENT avec ce JSON exact :
 {
@@ -34,12 +34,13 @@ Réponds UNIQUEMENT avec ce JSON exact :
   }
 }
 
-RÈGLES STRICTES :
-- Si le signal technique est BUY avec score >= 4 : confirme BUY sauf contradiction MAJEURE
-- Si le signal technique est SELL avec score >= 4 : confirme SELL sauf contradiction MAJEURE
-- Sois DÉCISIF. Un marché qui se consolide offre quand même des opportunités de scalping.
-- TP cible : 1.5% pour scalp rapide, 3% pour swing. SL : 0.8-1.5%.
-- Ne jamais retourner HOLD si le signal technique est >= 6 pts."""
+RÈGLES :
+- Confirme BUY seulement si ADX > 15 (tendance réelle) ET RSI < 68 ET volume > moyenne
+- Confidence MINIMUM pour un BUY valide : 0.65. En dessous, retourne HOLD.
+- Ratio TP/SL cible : 2.5:1 minimum. TP suggéré : 2.0-3.0%, SL : 0.7-1.2%.
+- Si marché en RANGING (ADX < 20), augmente le SL suggéré et réduis la confidence.
+- TRENDING_DOWN + score < 7 → HOLD obligatoire.
+- Score < 5 → toujours HOLD."""
 
 
 async def analyze_market(
@@ -79,24 +80,27 @@ async def analyze_market(
     support    = indicators.get("levels", {}).get("support", 0)
     resistance = indicators.get("levels", {}).get("resistance", 0)
 
-    prompt = f"""Signal technique {r_action} pour {symbol} — VALIDATION REQUISE
+    adx_quality = "TRENDING" if adx >= 20 else "RANGING (attention)"
+    prompt = f"""Signal technique pour {symbol} — VALIDATION REQUISE
 
-PRIX : ${current_price:.4f}  |  Capital dispo : ${safe_portfolio['available_usdt']:.2f}
+PRIX : ${current_price:.4f}  |  Capital : ${safe_portfolio['available_usdt']:.2f} USDT
 
 SIGNAL PRÉ-CALCULÉ : {r_action} (score={r_score}/15, conf={r_conf:.0%})
 Raisons : {r_reason}
 
-INDICATEURS :
-RSI={rsi:.1f} {'[SURVENDU]' if rsi < 35 else '[SURACHETÉ]' if rsi > 65 else '[neutre]'}
-MACD histo={macd_h:.6f} | EMA9={ema9:.2f} {'>' if ema9>ema21 else '<'} EMA21={ema21:.2f}
-ADX={adx:.1f} | BB_pct={bb_pct:.2f} | Volume={vol_r:.1f}x | CMF={cmf:.3f}
-Support=${support:.2f} | Résistance=${resistance:.2f}
+INDICATEURS 5m :
+RSI={rsi:.1f} {'[SURVENDU <35]' if rsi < 35 else '[SURACHETÉ >65]' if rsi > 65 else '[neutre]'}
+MACD_histo={macd_h:.6f} | EMA9={ema9:.4f} {'>' if ema9>ema21 else '<'} EMA21={ema21:.4f}
+ADX={adx:.1f} [{adx_quality}] | BB_pct={bb_pct:.2f} | Volume={vol_r:.1f}x avg | CMF={cmf:.3f}
+Support=${support:.4f} | Résistance=${resistance:.4f}
 Patterns: {', '.join(patterns) if patterns else 'Aucun'}
 
-PORTEFEUILLE : P&L={safe_portfolio['total_pnl_pct']:.1f}% | WinRate={safe_portfolio['win_rate']:.0f}%
+CONTEXTE : P&L={safe_portfolio['total_pnl_pct']:.1f}% | WinRate={safe_portfolio['win_rate']:.0f}%
 
-VALIDE ce signal. Si score >= 6, confirme SANS HÉSITATION.
-Pour le scalping 5m : TP=1.5%, SL=0.8% est optimal.
+EXIGENCES :
+- Confidence >= 0.65 pour trader, sinon HOLD
+- TP suggéré : 2.0-3.0% | SL : 0.7-1.2% | Ratio min 2.5:1
+- Si ADX < 20 (ranging) : confidence max 0.62
 Retourne UNIQUEMENT le JSON."""
 
     try:
