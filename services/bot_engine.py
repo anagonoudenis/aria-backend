@@ -30,32 +30,32 @@ SCAN_PAIRS = [
 # Paires nécessitant min notional $10 — exclues si capital < $15
 HIGH_NOTIONAL_PAIRS = {"BTCUSDT", "ETHUSDT"}
 
-# TP/SL — ratio 2.5:1
-TRAIL_TRIGGER_PCT  = 0.8   # trailing TP déclenché dès +0.8%
-TRAIL_STEP_PCT     = 0.4
+# TP/SL — ratio 3:1
+TRAIL_TRIGGER_PCT  = 0.8   # trailing SL activé dès +0.8% profit
+TRAIL_STEP_PCT     = 0.35  # SL trail = highest × (1 - 0.35%)
 BREAKEVEN_PCT      = 0.5
-STOP_LOSS_PCT      = 0.8
-TAKE_PROFIT_PCT    = 2.0   # ratio 2.5:1
+STOP_LOSS_PCT      = 0.9   # SL défaut légèrement plus large (évite faux triggers)
+TAKE_PROFIT_PCT    = 2.5   # TP défaut — ratio 2.8:1
 
 # Scalping haute confiance — TP rapide, SL serré
-SCALP_CONFIDENCE   = 0.80
-SCALP_SL_PCT       = 0.30
-SCALP_TP_PCT       = 0.8
+SCALP_CONFIDENCE   = 0.82
+SCALP_SL_PCT       = 0.40
+SCALP_TP_PCT       = 1.2
 
 # ── Filtres BULL market (BTC > EMA21) ────────────────────────────────────────
-MIN_CONFIDENCE_BULL      = 0.58   # 58% confiance
-MIN_COMPOSITE_SCORE_BULL = 2.5    # score×conf ≥ 2.5
-MIN_SCORE_RAW_BULL       = 4      # 4/15 points minimum
-MIN_ADX_BULL             = 8      # ADX souple en 5m
+MIN_CONFIDENCE_BULL      = 0.65   # 65% — aligné sur risk_manager
+MIN_COMPOSITE_SCORE_BULL = 3.5    # score×conf ≥ 3.5 (était 2.5)
+MIN_SCORE_RAW_BULL       = 5      # 5/15 minimum (était 4)
+MIN_ADX_BULL             = 20     # ADX ≥ 20 = tendance réelle (était 8)
 MIN_VOLUME_RATIO_BULL    = 1.1    # volume 1.1x la moyenne
 
 # ── Filtres BEAR market (BTC < EMA21) — rebonds oversold uniquement ──────────
-MIN_CONFIDENCE_BEAR      = 0.60   # 60% confiance
-MIN_COMPOSITE_SCORE_BEAR = 3.5    # score×conf ≥ 3.5
-MIN_SCORE_RAW_BEAR       = 5      # 5/15 minimum en bear (LTCUSDT score=5 passe)
-MIN_ADX_BEAR             = 8      # ADX très souple
-MIN_VOLUME_RATIO_BEAR    = 1.1    # volume 1.1x seulement (bear = volumes faibles)
-RSI_OVERSOLD_BEAR        = 55     # RSI < 55
+MIN_CONFIDENCE_BEAR      = 0.65   # 65% en bear aussi
+MIN_COMPOSITE_SCORE_BEAR = 4.0    # seuil plus strict en bear (était 3.5)
+MIN_SCORE_RAW_BEAR       = 5      # 5/15 minimum
+MIN_ADX_BEAR             = 15     # ADX ≥ 15 en bear
+MIN_VOLUME_RATIO_BEAR    = 1.1    # volume 1.1x
+RSI_OVERSOLD_BEAR        = 45     # RSI < 45 — vrai oversold (était 55)
 
 # Aliases (compatibilité)
 MIN_CONFIDENCE      = MIN_CONFIDENCE_BULL
@@ -63,9 +63,10 @@ MIN_COMPOSITE_SCORE = MIN_COMPOSITE_SCORE_BULL
 MIN_SCORE_RAW       = MIN_SCORE_RAW_BULL
 MIN_ADX             = MIN_ADX_BULL
 MIN_VOLUME_RATIO    = MIN_VOLUME_RATIO_BULL
-MAX_CONSECUTIVE_LOSSES = 6       # 6 pertes consécutives avant pause
-SL_COOLDOWN_SECONDS  = 15 * 60  # 15 min cooldown par paire (au lieu de 45)
-DAILY_MAX_LOSS_PCT   = 4.0       # stoppe si perte journalière > 4% du capital
+MAX_CONSECUTIVE_LOSSES   = 5        # pause après 5 pertes (était 6)
+SL_COOLDOWN_SECONDS      = 30 * 60  # 30 min cooldown par paire après SL
+MIN_TRADE_INTERVAL_SECS  = 25 * 60  # 25 min minimum entre deux trades
+DAILY_MAX_LOSS_PCT        = 3.0     # stoppe si perte journalière > 3% (était 4%)
 
 _active_cycles: set = set()
 
@@ -108,12 +109,39 @@ class BotEngine:
 
     async def _bot_loop(self, user_id: str, interval_seconds: int) -> None:
         logger.info(f"[{user_id}] Loop started ({interval_seconds}s)")
+        # Monitoring positions indépendant — vérifie SL/TP toutes les 30s
+        asyncio.create_task(self._position_monitor_loop(user_id))
         await self._run_cycle_safe(user_id)
         while self.is_running(user_id):
             await asyncio.sleep(interval_seconds)
             if self.is_running(user_id):
                 await self._run_cycle_safe(user_id)
         logger.info(f"[{user_id}] Loop stopped")
+
+    async def _position_monitor_loop(self, user_id: str) -> None:
+        """Surveille les positions ouvertes toutes les 30s — SL/TP en temps quasi-réel."""
+        logger.info(f"[{user_id}] Position monitor started (30s)")
+        while self.is_running(user_id):
+            await asyncio.sleep(30)
+            if not self.is_running(user_id):
+                break
+            try:
+                db = get_database()
+                open_trades = await db.trades.find(
+                    {"user_id": user_id, "status": "OPEN"}
+                ).to_list(10)
+                if not open_trades:
+                    continue
+                syms   = list({t.get("symbol") for t in open_trades})
+                prices = await self._fetch_prices(syms)
+                for trade in open_trades:
+                    sym   = trade.get("symbol", "")
+                    price = prices.get(sym)
+                    if price:
+                        await self._manage_position(user_id, trade, price, db)
+            except Exception as e:
+                logger.debug(f"[{user_id}] Position monitor error: {e}")
+        logger.info(f"[{user_id}] Position monitor stopped")
 
     async def stop(self, user_id: str, reason: str = "Manuel") -> None:
         if user_id not in self._running_bots:
@@ -214,6 +242,17 @@ class BotEngine:
 
         consecutive = risk_manager.count_consecutive_losses(recent_trades)
         bot_info["consecutive_losses"] = consecutive
+
+        # ── 4b. Cooldown minimum entre deux trades ────────────────────────────
+        last_trade_at = bot_info.get("last_trade_at")
+        if last_trade_at:
+            elapsed = (datetime.now(timezone.utc) - last_trade_at).total_seconds()
+            if elapsed < MIN_TRADE_INTERVAL_SECS:
+                remaining = int(MIN_TRADE_INTERVAL_SECS - elapsed)
+                logger.info(f"[{user_id}] Cooldown inter-trades: {remaining}s restants — attente")
+                bot_info["cycles_count"] += 1
+                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+                return
 
         if consecutive >= MAX_CONSECUTIVE_LOSSES:
             reason = f"Circuit breaker: {consecutive} pertes consécutives"
@@ -415,6 +454,7 @@ class BotEngine:
                 sl_pct, tp_pct, signal_data, portfolio_data, config,
                 indicators=indicators,
             )
+            bot_info["last_trade_at"] = datetime.now(timezone.utc)
 
         bot_info["cycles_count"] += 1
         bot_info["last_cycle_at"] = datetime.now(timezone.utc)
@@ -507,6 +547,16 @@ class BotEngine:
             bot_info["pending_entry"] = None
             return False
 
+        # Vérifier si max positions déjà atteint
+        open_trades_now = await db.trades.find(
+            {"user_id": user_id, "status": "OPEN"}
+        ).to_list(20)
+        max_pos = self._get_max_positions(portfolio_data.get("available_usdt", 0))
+        if len(open_trades_now) >= max_pos:
+            logger.info(f"[{user_id}] Pending entry {symbol} annulé — max positions atteint ({len(open_trades_now)}/{max_pos})")
+            bot_info["pending_entry"] = None
+            return False
+
         current_price = prices.get(symbol, 0)
         if current_price <= 0:
             return False
@@ -537,6 +587,7 @@ class BotEngine:
                 indicators=pending.get("indicators"),
             )
             bot_info["pending_entry"] = None
+            bot_info["last_trade_at"] = datetime.now(timezone.utc)
             return True
 
         remaining = int((expires_at - now).total_seconds())
@@ -622,10 +673,15 @@ class BotEngine:
                 logger.info(f"[{user_id}] {sym}: OVERSOLD EXTREME RSI={rsi:.0f} → BUY force")
 
             elif action_5m in ("SELL", "HOLD"):
-                # Buy-the-dip : 5m baissier + au moins 1 TF sup haussier
-                # Actif en BEAR et NEUTRAL, RSI pas trop élevé
-                rsi_max = 55 if market_mode == "BEAR" else 62
-                btd = ((action_15m == "BUY" or action_1h == "BUY") and rsi < rsi_max)
+                # Buy-the-dip : 5m baissier mais TFs supérieurs haussiers
+                # BULL : exige DEUX TFs haussiers (15m ET 1h) + RSI < 50
+                # BEAR/NEUTRAL : un seul TF suffit + RSI très oversold
+                if market_mode == "BULL":
+                    btd = (action_15m == "BUY" and action_1h == "BUY" and rsi < 50)
+                elif market_mode == "BEAR":
+                    btd = ((action_15m == "BUY" or action_1h == "BUY") and rsi < 40)
+                else:  # NEUTRAL
+                    btd = ((action_15m == "BUY" or action_1h == "BUY") and rsi < 50)
                 if btd:
                     effective_action = "BUY"
                     effective_score  = max(score_5m, score_15m)
@@ -751,15 +807,17 @@ class BotEngine:
             logger.warning(f"Claude failed for {sym}: {e} — using rule-based")
             signal_data = claude_service._from_rule(rule_sig, indicators)
 
-        # Forcer BUY si buy_the_dip et Claude hésite
+        # Override Claude uniquement si buy_the_dip ET 1h confirme BUY (signal fort)
         if best_candidate.get("buy_the_dip") and signal_data.get("action") not in ("BUY",):
-            rule_action = best_candidate["rule_sig"].get("action", "HOLD")
-            rule_score  = best_candidate["rule_sig"].get("score", 0)
-            # Buy-the-dip : si 15m+1h sont BUY, ignorer les hésitations de Claude
-            if rule_score >= MIN_SCORE_RAW_BEAR:
+            rule_score    = best_candidate["rule_sig"].get("score", 0)
+            confirm_1h    = best_candidate.get("confluence_1h") == "BUY"
+            # Exiger que la 1h soit BUY ET score suffisant
+            if confirm_1h and rule_score >= MIN_SCORE_RAW_BEAR:
                 signal_data["action"]     = "BUY"
-                signal_data["confidence"] = max(signal_data.get("confidence", 0.60), 0.62)
-                logger.info(f"[{user_id}] Buy-the-dip override: {sym} → BUY {signal_data['confidence']:.0%}")
+                signal_data["confidence"] = max(signal_data.get("confidence", 0.65), 0.66)
+                logger.info(f"[{user_id}] Buy-the-dip override (1h BUY): {sym} → BUY {signal_data['confidence']:.0%}")
+            else:
+                logger.info(f"[{user_id}] Buy-the-dip override annulé: 1h={best_candidate.get('confluence_1h')} score={rule_score}")
 
         bonus = 1.5 if best_candidate.get("triple_bull") else (1.2 if best_candidate.get("buy_the_dip") else 1.0)
         composite = round(best_candidate["score"] * signal_data["confidence"] * bonus, 2)
@@ -877,12 +935,11 @@ class BotEngine:
     async def _manage_position(
         self, user_id: str, trade: dict, price: float, db
     ) -> None:
-        entry     = float(trade.get("price", 0))
-        qty       = float(trade.get("quantity", 0))
-        tp_price  = float(trade.get("take_profit_price",  entry * (1 + TAKE_PROFIT_PCT / 100)))
-        sl_price  = float(trade.get("stop_loss_price",    entry * (1 - STOP_LOSS_PCT  / 100)))
-        highest   = float(trade.get("highest_price_seen", entry))
-        trailing_tp = float(trade.get("trailing_tp_price", tp_price))
+        entry    = float(trade.get("price", 0))
+        qty      = float(trade.get("quantity", 0))
+        tp_price = float(trade.get("take_profit_price", entry * (1 + TAKE_PROFIT_PCT / 100)))
+        sl_price = float(trade.get("stop_loss_price",   entry * (1 - STOP_LOSS_PCT  / 100)))
+        highest  = float(trade.get("highest_price_seen", entry))
 
         if not entry or not qty:
             return
@@ -899,22 +956,23 @@ class BotEngine:
             updates["highest_price_seen"] = price
             highest = price
 
-        # ── BREAKEVEN rapide : dès +0.7%, SL monte à l'entrée ────────────────
+        # ── BREAKEVEN : dès +0.5%, SL monte à l'entrée + 0.1% ───────────────
         if pnl_pct >= BREAKEVEN_PCT and sl_price < entry:
-            new_sl = entry * 1.001
+            new_sl = round(entry * 1.001, 8)
             updates["stop_loss_price"] = new_sl
             sl_price = new_sl
-            logger.info(f"[{user_id}] Breakeven {trade['symbol']}: SL -> ${new_sl:.4f}")
+            logger.info(f"[{user_id}] Breakeven {trade['symbol']}: SL → {new_sl:.4f} (+0.1%)")
 
-        # ── TRAILING TAKE-PROFIT adaptatif ─────────────────────────────────
+        # ── TRAILING SL : dès +0.8%, SL suit le plus haut à -trail_step% ────
+        # SL monte uniquement → lock les gains progressivement
         if pnl_pct >= TRAIL_TRIGGER_PCT:
-            new_trailing_tp = price * (1 + trail_step / 100)
-            if new_trailing_tp > trailing_tp:
-                updates["trailing_tp_price"] = new_trailing_tp
-                trailing_tp = new_trailing_tp
+            trail_floor = round(highest * (1 - trail_step / 100), 8)
+            if trail_floor > sl_price:
+                updates["stop_loss_price"] = trail_floor
+                sl_price = trail_floor
                 logger.info(
-                    f"[{user_id}] Trailing TP {trade['symbol']}: "
-                    f"+{pnl_pct:.1f}% -> TP ${new_trailing_tp:.4f} (step={trail_step}%)"
+                    f"[{user_id}] Trailing SL {trade['symbol']}: "
+                    f"+{pnl_pct:.1f}% highest={highest:.4f} → SL={trail_floor:.4f}"
                 )
 
         if updates:
@@ -922,25 +980,15 @@ class BotEngine:
 
         # ── FERMETURE ─────────────────────────────────────────────────────────
 
-        # Take-profit original atteint → activer le trailing
-        if price >= tp_price and pnl_pct < TRAIL_TRIGGER_PCT + 1:
-            updates["trailing_tp_active"] = True
-            await db.trades.update_one({"_id": trade["_id"]}, {"$set": updates})
-
-        # Trailing TP déclenché (prix redescend sous le trailing TP)
-        trailing_active = trade.get("trailing_tp_active", False)
-        if trailing_active and price <= trailing_tp * 0.998:  # 0.2% de marge
-            await self._close_position(user_id, trade, price, "trailing_tp")
-            return
-
-        # Take-profit simple (non trailing)
-        if not trailing_active and price >= tp_price:
+        # Take-profit atteint
+        if price >= tp_price:
             await self._close_position(user_id, trade, price, "take_profit")
             return
 
-        # Stop-loss
+        # Stop-loss (inclut le trailing SL mis à jour ci-dessus)
         if price <= sl_price:
-            await self._close_position(user_id, trade, price, "stop_loss")
+            reason = "trailing_stop" if pnl_pct > 0 else "stop_loss"
+            await self._close_position(user_id, trade, price, reason)
             return
 
     # ══════════════════════════════════════════════════════════════════════════
