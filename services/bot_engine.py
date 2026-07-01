@@ -212,14 +212,15 @@ class BotEngine:
 
         # ── 2b. Reset journalier + circuit breaker perte journalière ─────────
         today = datetime.now(timezone.utc).date()
+        total_usdt = portfolio_data.get("total_usdt", available_usdt)
         if bot_info.get("last_day_reset") != today:
-            bot_info["daily_start_capital"] = available_usdt
+            bot_info["daily_start_capital"] = total_usdt
             bot_info["last_day_reset"]       = today
-            logger.info(f"[{user_id}] Nouveau jour — capital de reference: {available_usdt:.2f} USDT")
+            logger.info(f"[{user_id}] Nouveau jour — capital de reference: {total_usdt:.2f} USDT")
 
-        daily_start = bot_info.get("daily_start_capital", available_usdt)
+        daily_start = bot_info.get("daily_start_capital", total_usdt)
         if daily_start > 0:
-            daily_loss_pct = (daily_start - available_usdt) / daily_start * 100
+            daily_loss_pct = (daily_start - total_usdt) / daily_start * 100
             if daily_loss_pct >= DAILY_MAX_LOSS_PCT:
                 logger.warning(
                     f"[{user_id}] Perte journaliere {daily_loss_pct:.1f}% "
