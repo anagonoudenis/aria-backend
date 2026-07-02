@@ -812,8 +812,9 @@ class BotEngine:
                     logger.info(f"[{user_id}] {sym}: ADX={adx:.1f} < {adx_min} ({market_mode}) — skip")
                     continue
 
-                # Volume minimum — spike réel requis pour confirmer le mouvement
-                vol_min = 1.5 if market_mode == "BULL" else 1.2
+                # Volume minimum — BTD = pullback naturellement à faible volume
+                is_btd_signal = (action_5m != "BUY" and effective_action == "BUY")
+                vol_min = 0.8 if is_btd_signal else (1.5 if market_mode == "BULL" else 1.2)
                 if vol_ratio < vol_min:
                     logger.info(f"[{user_id}] {sym}: vol={vol_ratio:.1f}x < {vol_min}x ({market_mode}) — skip")
                     continue
