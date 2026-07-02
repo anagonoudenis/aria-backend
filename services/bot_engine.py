@@ -314,6 +314,18 @@ class BotEngine:
         indicators    = best["indicators"]
         current_price = prices.get(symbol, 0)
 
+        # Hot pairs (ex: ZECUSDT) peuvent ne pas être dans prices — fetch direct
+        if current_price <= 0:
+            try:
+                current_price = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: binance_service.get_current_price(symbol)
+                )
+            except Exception as e_price:
+                logger.warning(f"[{user_id}] Prix {symbol} introuvable ({e_price}) — signal ignoré")
+                bot_info["cycles_count"] += 1
+                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+                return
+
         logger.info(
             f"[{user_id}] Signal: {symbol} "
             f"action={signal_data['action']} conf={signal_data['confidence']:.0%} "
@@ -505,12 +517,13 @@ class BotEngine:
             )
         else:
             # Prix deja proche ou sous EMA9 → entree immediate
-            await self._execute_buy(
+            buy_ok = await self._execute_buy(
                 user_id, db, symbol, position_usdt, current_price,
                 sl_pct, tp_pct, signal_data, portfolio_data, config,
                 indicators=indicators,
             )
-            bot_info["last_trade_at"] = datetime.now(timezone.utc)
+            if buy_ok:
+                bot_info["last_trade_at"] = datetime.now(timezone.utc)
 
         bot_info["cycles_count"] += 1
         bot_info["last_cycle_at"] = datetime.now(timezone.utc)
@@ -636,15 +649,16 @@ class BotEngine:
             )
 
             config = pending["config"]
-            await self._execute_buy(
+            buy_ok = await self._execute_buy(
                 user_id, db, symbol, position_usdt, current_price,
                 pending["sl_pct"], pending["tp_pct"],
                 pending["signal_data"], portfolio_data, config,
                 indicators=pending.get("indicators"),
             )
             bot_info["pending_entry"] = None
-            bot_info["last_trade_at"] = datetime.now(timezone.utc)
-            return True
+            if buy_ok:
+                bot_info["last_trade_at"] = datetime.now(timezone.utc)
+            return bool(buy_ok)
 
         remaining = int((expires_at - now).total_seconds())
         logger.info(
@@ -919,7 +933,14 @@ class BotEngine:
         sym        = best_candidate["symbol"]
         indicators = best_candidate["indicators"]
         rule_sig   = best_candidate["rule_sig"]
-        price      = prices.get(sym, 0)
+        price = prices.get(sym, 0)
+        if price <= 0:
+            try:
+                price = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: binance_service.get_current_price(sym)
+                )
+            except Exception:
+                price = 0
         pf         = portfolio_data or {}
 
         tag = "[BUY-THE-DIP]" if best_candidate.get("buy_the_dip") else ("[TRIPLE BULL]" if best_candidate.get("triple_bull") else "")
@@ -1157,7 +1178,7 @@ class BotEngine:
         sl_pct: float, tp_pct: float,
         signal_data: Dict, portfolio_data: Dict, config: Dict,
         indicators: Optional[Dict] = None,
-    ) -> None:
+    ) -> bool:
         """Place un ordre BUY et sauvegarde le trade."""
         # Garde-fou spread — évite les achats en marché illiquide (mauvais prix d'exécution)
         try:
@@ -1166,7 +1187,7 @@ class BotEngine:
             )
             if spread_pct > 0.25:
                 logger.warning(f"[{user_id}] {symbol}: spread {spread_pct:.3f}% trop large — achat annulé")
-                return
+                return False
         except Exception as e_spread:
             logger.debug(f"Spread check {symbol} non bloquant: {e_spread}")
 
@@ -1186,7 +1207,7 @@ class BotEngine:
             order_id = str(order.get("orderId", ""))
         except Exception as e:
             logger.error(f"[{user_id}] BUY {symbol} failed: {e}")
-            return
+            return False
 
         tp_price = ex_price * (1 + tp_pct / 100)
         sl_price = ex_price * (1 - sl_pct / 100)
@@ -1230,7 +1251,7 @@ class BotEngine:
             trade_id = str(res.inserted_id)
         except Exception as e:
             logger.error(f"[{user_id}] Trade save failed: {e}")
-            return
+            return False
 
         logger.info(
             f"[{user_id}] ✅ BUY {ex_qty} {symbol} @ {ex_price:.4f} "
@@ -1255,6 +1276,7 @@ class BotEngine:
             "total_usdt": total, "take_profit": tp_price, "stop_loss": sl_price,
         })
         await self._broadcast(user_id, "portfolio_update", updated)
+        return True
 
     async def _close_position(
         self, user_id: str, trade: dict, close_price: float, reason: str
