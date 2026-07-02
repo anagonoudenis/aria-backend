@@ -39,19 +39,19 @@ TAKE_PROFIT_PCT    = 2.5   # TP défaut — ratio 2.8:1
 
 
 # ── Filtres BULL market (BTC > EMA21) ────────────────────────────────────────
-MIN_CONFIDENCE_BULL      = 0.65   # 65% — aligné sur risk_manager
-MIN_COMPOSITE_SCORE_BULL = 3.5    # score×conf ≥ 3.5 (était 2.5)
-MIN_SCORE_RAW_BULL       = 5      # 5/15 minimum (était 4)
-MIN_ADX_BULL             = 20     # ADX ≥ 20 = tendance réelle (était 8)
-MIN_VOLUME_RATIO_BULL    = 1.1    # volume 1.1x la moyenne
+MIN_CONFIDENCE_BULL      = 0.72   # 72% — exige signal de qualité
+MIN_COMPOSITE_SCORE_BULL = 6.0    # score×conf×bonus ≥ 6.0 (était 3.5)
+MIN_SCORE_RAW_BULL       = 7      # 7/15 minimum (était 5)
+MIN_ADX_BULL             = 20     # ADX ≥ 20 = tendance réelle
+MIN_VOLUME_RATIO_BULL    = 1.5    # volume 1.5x la moyenne
 
 # ── Filtres BEAR market (BTC < EMA21) — rebonds oversold uniquement ──────────
-MIN_CONFIDENCE_BEAR      = 0.65   # 65% en bear aussi
-MIN_COMPOSITE_SCORE_BEAR = 4.0    # seuil plus strict en bear (était 3.5)
-MIN_SCORE_RAW_BEAR       = 5      # 5/15 minimum
+MIN_CONFIDENCE_BEAR      = 0.70   # 70% en bear
+MIN_COMPOSITE_SCORE_BEAR = 6.5    # seuil strict en bear (était 4.0)
+MIN_SCORE_RAW_BEAR       = 7      # 7/15 minimum (était 5)
 MIN_ADX_BEAR             = 15     # ADX ≥ 15 en bear
-MIN_VOLUME_RATIO_BEAR    = 1.1    # volume 1.1x
-RSI_OVERSOLD_BEAR        = 45     # RSI < 45 — vrai oversold (était 55)
+MIN_VOLUME_RATIO_BEAR    = 1.2    # volume 1.2x
+RSI_OVERSOLD_BEAR        = 42     # RSI < 42 — vrai oversold (était 45)
 
 # Aliases (compatibilité)
 MIN_CONFIDENCE      = MIN_CONFIDENCE_BULL
@@ -940,7 +940,7 @@ class BotEngine:
             rule_score    = best_candidate["rule_sig"].get("score", 0)
             confirm_1h    = best_candidate.get("confluence_1h") == "BUY"
             # Exiger que la 1h soit BUY ET score suffisant
-            if confirm_1h and rule_score >= MIN_SCORE_RAW_BEAR:
+            if confirm_1h and rule_score >= 10:
                 signal_data["action"]     = "BUY"
                 signal_data["confidence"] = max(signal_data.get("confidence", 0.65), 0.66)
                 logger.info(f"[{user_id}] Buy-the-dip override (1h BUY): {sym} → BUY {signal_data['confidence']:.0%}")

@@ -118,8 +118,8 @@ Retourne UNIQUEMENT le JSON."""
         result = _parse(raw)
         if result:
             validated = _validate(result)
-            # Override si Claude devient trop conservateur sur un bon signal
-            if validated["action"] == "HOLD" and r_action != "HOLD" and r_score >= 6:
+            # Override seulement si signal technique TRES fort (score ≥ 10/15)
+            if validated["action"] == "HOLD" and r_action != "HOLD" and r_score >= 10:
                 logger.info(f"Claude HOLD overridden: {r_action} score={r_score}")
                 validated["action"]     = r_action
                 validated["confidence"] = max(validated["confidence"], r_conf)
