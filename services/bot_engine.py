@@ -96,7 +96,8 @@ class BotEngine:
             "circuit_breaker_reason": None,
             "cb_last_reset_at": datetime.now(timezone.utc),
             "scan_results": {},
-            "sl_cooldown": {},          # {symbol: datetime} — paires en cooldown après SL
+            "sl_cooldown": {},          # {symbol: expiry_datetime} — paires en cooldown après SL
+            "pair_losses": {},         # {symbol: count} — SL consécutifs par paire
             "pending_entry": None,     # signal en attente d'un pullback vers EMA9
             "daily_start_capital": 0.0,  # capital en début de journée UTC
             "last_day_reset": None,    # date du dernier reset journalier
@@ -104,6 +105,34 @@ class BotEngine:
 
         db = get_database()
         await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"bot_config.is_running": True}})
+
+        # Reconstruire sl_cooldown depuis MongoDB — survit aux redéploiements
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=8)
+            recent_sl = await db.trades.find({
+                "user_id": user_id, "status": "CLOSED",
+                "close_reason": "stop_loss", "closed_at": {"$gt": cutoff}
+            }).sort("closed_at", 1).to_list(100)
+            pair_counts: Dict[str, int] = {}
+            for t in recent_sl:
+                sym = t.get("symbol", "")
+                closed_at = t.get("closed_at")
+                if not sym or not closed_at:
+                    continue
+                if closed_at.tzinfo is None:
+                    closed_at = closed_at.replace(tzinfo=timezone.utc)
+                pair_counts[sym] = pair_counts.get(sym, 0) + 1
+                cnt = pair_counts[sym]
+                secs = 8 * 3600 if cnt >= 3 else (3 * 3600 if cnt >= 2 else 45 * 60)
+                expiry = closed_at + timedelta(seconds=secs)
+                if expiry > datetime.now(timezone.utc):
+                    self._running_bots[user_id]["sl_cooldown"][sym] = expiry
+                    self._running_bots[user_id]["pair_losses"][sym] = cnt
+            if self._running_bots[user_id]["sl_cooldown"]:
+                logger.info(f"[{user_id}] SL cooldown restauré: {list(self._running_bots[user_id]['sl_cooldown'].keys())}")
+        except Exception as e:
+            logger.warning(f"[{user_id}] SL cooldown restore failed: {e}")
+
         logger.info(f"Bot started: user={user_id} interval={interval} scanning={SCAN_PAIRS}")
         asyncio.create_task(self._bot_loop(user_id, interval_seconds))
 
@@ -726,7 +755,7 @@ class BotEngine:
             and (s not in HIGH_NOTIONAL_PAIRS or available >= 15.0)
             and (
                 s not in sl_cooldown
-                or (now - sl_cooldown[s]).total_seconds() > SL_COOLDOWN_SECONDS
+                or now > sl_cooldown[s]
             )
         ]
         if not candidates:
@@ -1360,12 +1389,21 @@ class BotEngine:
                 bot_info.get("consecutive_losses", 0) + 1 if pnl < 0 else 0
             )
 
-            # Cooldown 45 min sur la paire après un SL
+            # Cooldown adaptatif par paire : 45min → 3h → 8h selon pertes consécutives
             if reason == "stop_loss":
                 if "sl_cooldown" not in bot_info:
                     bot_info["sl_cooldown"] = {}
-                bot_info["sl_cooldown"][symbol] = datetime.now(timezone.utc)
-                logger.info(f"[{user_id}] Cooldown 45min sur {symbol} apres stop_loss")
+                if "pair_losses" not in bot_info:
+                    bot_info["pair_losses"] = {}
+                pair_count = bot_info["pair_losses"].get(symbol, 0) + 1
+                bot_info["pair_losses"][symbol] = pair_count
+                secs = 8 * 3600 if pair_count >= 3 else (3 * 3600 if pair_count >= 2 else 45 * 60)
+                bot_info["sl_cooldown"][symbol] = datetime.now(timezone.utc) + timedelta(seconds=secs)
+                logger.info(f"[{user_id}] {symbol}: cooldown {secs//60}min ({pair_count} SL consecutifs)")
+            elif pnl > 0:
+                # Victoire sur cette paire → reset son compteur de pertes
+                if "pair_losses" in bot_info:
+                    bot_info["pair_losses"].pop(symbol, None)
 
             await self._update_portfolio(db, user_id)
 
