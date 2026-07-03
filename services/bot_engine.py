@@ -32,8 +32,8 @@ HIGH_NOTIONAL_PAIRS = {"BTCUSDT", "ETHUSDT"}
 
 # TP/SL — ratio 3:1
 TRAIL_TRIGGER_PCT  = 0.8   # trailing SL activé dès +0.8% profit
-TRAIL_STEP_PCT     = 0.35  # SL trail = highest × (1 - 0.35%)
-BREAKEVEN_PCT      = 0.5
+TRAIL_STEP_PCT     = 0.20  # SL trail = highest × (1 - 0.20%) — plus serré pour locker les gains
+BREAKEVEN_PCT      = 0.3   # SL → entrée dès +0.3% (était 0.5%)
 STOP_LOSS_PCT      = 0.9   # SL défaut légèrement plus large (évite faux triggers)
 TAKE_PROFIT_PCT    = 2.5   # TP défaut — ratio 2.8:1
 
@@ -420,8 +420,8 @@ class BotEngine:
         if atr > 0 and current_price > 0:
             raw_sl = (1.0 * atr / current_price) * 100
             raw_tp = (3.0 * atr / current_price) * 100
-            # SL [0.7%-1.5%] — plus large pour absorber le bruit 5m, TP [2.0%-5.0%]
-            sl_pct = round(max(min(raw_sl, 1.5), 0.7), 3)
+            # SL [0.7%-1.0%] — plafonné à 1.0% pour limiter les pertes max, TP [2.0%-5.0%]
+            sl_pct = round(max(min(raw_sl, 1.0), 0.7), 3)
             tp_pct = round(max(min(raw_tp, 5.0), max(2.0, sl_pct * 2.8)), 3)
             logger.info(
                 f"[{user_id}] ATR SL={sl_pct}% TP={tp_pct}% ratio={tp_pct/sl_pct:.1f}:1 conf={conf:.0%}"
@@ -909,6 +909,12 @@ class BotEngine:
             elif action_4h == "SELL" and rsi > 38:
                 confluence_mult = round(confluence_mult * 0.85, 3)
                 logger.debug(f"{sym}: 4h SELL — confluence ×0.85 (RSI={rsi:.0f})")
+
+            # 4h SELL en BULL sans BTD = contre-tendance macro → refuse
+            # (n'affecte pas BEAR/NEUTRAL ni les buy-the-dip)
+            if action_4h == "SELL" and market_mode == "BULL" and not is_btd_signal:
+                logger.info(f"[{user_id}] {sym}: 4h SELL en BULL — contre-tendance macro, skip")
+                continue
 
             score = round(effective_score * confluence_mult, 1)
 
