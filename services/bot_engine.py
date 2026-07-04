@@ -20,15 +20,21 @@ logger = get_logger(__name__)
 INTERVAL_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
 BINANCE_FEE      = 0.001
 
-# 20 paires liquides — couvre bull ET bear market
+# 17 paires liquides — couvre bull ET bear market
 SCAN_PAIRS = [
-    "BNBUSDT",  "SOLUSDT",  "XRPUSDT",  "DOGEUSDT", "ADAUSDT",
-    "DOTUSDT",  "LTCUSDT",  "TRXUSDT",  "LINKUSDT", "AVAXUSDT",
+    "BNBUSDT",  "SOLUSDT",  "XRPUSDT",  "ADAUSDT",
+    "LTCUSDT",  "TRXUSDT",  "LINKUSDT",
     "ETHUSDT",  "SHIBUSDT", "UNIUSDT",  "ATOMUSDT", "NEARUSDT",
     "APTUSDT",  "ARBUSDT",  "OPUSDT",   "INJUSDT",  "SUIUSDT",
 ]
 # Paires nécessitant min notional $10 — exclues si capital < $15
 HIGH_NOTIONAL_PAIRS = {"BTCUSDT", "ETHUSDT"}
+# Paires à 0% WR sur 5+ trades — exclues du scan et des hot pairs
+BANNED_PAIRS = {"DOGEUSDT", "AVAXUSDT", "DOTUSDT"}
+# Paires avec historique difficile — seuils ADX/score renforcés
+PAIR_EXTRA_FILTERS: Dict[str, Dict] = {
+    "BNBUSDT": {"min_adx_bonus": 5, "min_score_bonus": 1},
+}
 
 # TP/SL — ratio 3:1
 TRAIL_TRIGGER_PCT  = 0.8   # trailing SL activé dès +0.8% profit
@@ -752,6 +758,7 @@ class BotEngine:
         candidates = [
             s for s in effective_symbols
             if s not in open_symbols
+            and s not in BANNED_PAIRS
             and (s not in HIGH_NOTIONAL_PAIRS or available >= 15.0)
             and (
                 s not in sl_cooldown
@@ -840,6 +847,18 @@ class BotEngine:
                 if adx < adx_min:
                     logger.info(f"[{user_id}] {sym}: ADX={adx:.1f} < {adx_min} ({market_mode}) — skip")
                     continue
+
+                # Filtres renforcés pour paires à historique difficile
+                extra = PAIR_EXTRA_FILTERS.get(sym)
+                if extra:
+                    adx_req   = adx_min + extra.get("min_adx_bonus", 0)
+                    score_req = min_raw  + extra.get("min_score_bonus", 0)
+                    if adx < adx_req:
+                        logger.info(f"[{user_id}] {sym}: ADX={adx:.1f} < {adx_req} (filtre renforce) — skip")
+                        continue
+                    if effective_score < score_req:
+                        logger.info(f"[{user_id}] {sym}: score {effective_score} < {score_req} (filtre renforce) — skip")
+                        continue
 
                 # Volume minimum — BTD = pullback naturellement à faible volume
                 is_btd_signal = (action_5m != "BUY" and effective_action == "BUY")
@@ -1191,6 +1210,34 @@ class BotEngine:
         if updates:
             await db.trades.update_one({"_id": trade["_id"]}, {"$set": updates})
 
+        # ── SORTIE ANTICIPÉE — retournement de signal (avant SL) ─────────────
+        # Si 15m + 1h retournent tous les deux SELL pendant qu'on est en perte
+        # → sortir tôt à -0.2/-0.5% plutôt qu'attendre le SL complet à -0.9%
+        if pnl_pct < -0.15 and price > sl_price:
+            now_ts    = datetime.now(timezone.utc).timestamp()
+            last_check = float(trade.get("last_signal_check_ts") or 0)
+            if now_ts - last_check >= 300:  # vérif max toutes les 5 min
+                try:
+                    sym    = trade.get("symbol", "")
+                    result = await self._analyze_pair_fast(sym)
+                    if result and len(result) >= 4:
+                        _, _, rule_15m, rule_1h = result[:4]
+                        a15 = rule_15m.get("action", "HOLD")
+                        a1h = rule_1h.get("action", "HOLD")
+                        if a15 == "SELL" and a1h == "SELL":
+                            logger.info(
+                                f"[{user_id}] {sym}: retournement 15m+1h SELL "
+                                f"pnl={pnl_pct:.2f}% — sortie anticipee"
+                            )
+                            await self._close_position(user_id, trade, price, "signal_reversal")
+                            return
+                except Exception as e_rev:
+                    logger.debug(f"[{user_id}] Signal reversal check: {e_rev}")
+                await db.trades.update_one(
+                    {"_id": trade["_id"]},
+                    {"$set": {"last_signal_check_ts": now_ts}}
+                )
+
         # ── FERMETURE ─────────────────────────────────────────────────────────
 
         # Take-profit atteint
@@ -1390,7 +1437,7 @@ class BotEngine:
             )
 
             # Cooldown adaptatif par paire : 45min → 3h → 8h selon pertes consécutives
-            if reason == "stop_loss":
+            if reason in ("stop_loss", "signal_reversal"):
                 if "sl_cooldown" not in bot_info:
                     bot_info["sl_cooldown"] = {}
                 if "pair_losses" not in bot_info:
