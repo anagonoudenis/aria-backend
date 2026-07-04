@@ -12,6 +12,10 @@ logger = get_logger(__name__)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_indicators(df: pd.DataFrame, symbol: str = "") -> Dict[str, Any]:
+    MIN_CANDLES = 30
+    if df is None or len(df) < MIN_CANDLES:
+        logger.warning(f"compute_indicators: {symbol} — données insuffisantes ({len(df) if df is not None else 0} bougies < {MIN_CANDLES}) — skip")
+        return {}
     try:
         df = df.copy()
         for col in ["open", "high", "low", "close", "volume"]:
