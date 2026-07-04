@@ -324,7 +324,7 @@ class BotEngine:
             {"user_id": user_id, "status": "OPEN"}
         ).to_list(20)
         open_symbols  = {t.get("symbol") for t in open_trades}
-        max_positions = self._get_max_positions(available_usdt)
+        max_positions = self._get_max_positions(total_usdt)
 
         if len(open_trades) >= max_positions:
             logger.info(f"[{user_id}] Max positions ({len(open_trades)}/{max_positions}) — attente")
@@ -655,7 +655,7 @@ class BotEngine:
         open_trades_now = await db.trades.find(
             {"user_id": user_id, "status": "OPEN"}
         ).to_list(20)
-        max_pos = self._get_max_positions(portfolio_data.get("available_usdt", 0))
+        max_pos = self._get_max_positions(portfolio_data.get("total_usdt", 0))
         if len(open_trades_now) >= max_pos:
             logger.info(f"[{user_id}] Pending entry {symbol} annulé — max positions atteint ({len(open_trades_now)}/{max_pos})")
             bot_info["pending_entry"] = None
@@ -673,7 +673,7 @@ class BotEngine:
                 bot_info["pending_entry"] = None
                 return False
 
-            max_positions = self._get_max_positions(available_usdt)
+            max_positions = self._get_max_positions(portfolio_data.get("total_usdt", available_usdt))
             position_usdt = (available_usdt / max_positions) * 0.90
             position_usdt = max(position_usdt, 5.50)
             position_usdt = min(position_usdt, available_usdt * 0.95)
@@ -1591,12 +1591,11 @@ class BotEngine:
             logger.error(f"Portfolio update error {user_id}: {e}")
 
     @staticmethod
-    def _get_max_positions(available_usdt: float) -> int:
-        """Nombre max de positions simultanées selon le capital disponible."""
-        if available_usdt < 15.0:  return 1
-        if available_usdt < 25.0:  return 2
-        if available_usdt < 50.0:  return 3
-        return 4
+    def _get_max_positions(total_usdt: float) -> int:
+        """Nombre max de positions simultanées — 1 position par tranche de 12$ de capital total."""
+        MIN_PAR_POSITION = 12.0
+        MAX_POSITIONS    = 6
+        return max(1, min(MAX_POSITIONS, int(total_usdt // MIN_PAR_POSITION)))
 
     async def _broadcast(self, user_id: str, message_type: str, data: Dict[str, Any]) -> None:
         from routers.websocket import send_update
