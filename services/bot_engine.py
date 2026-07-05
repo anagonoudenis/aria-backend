@@ -762,6 +762,7 @@ class BotEngine:
                     and abs(p.get("change_pct", 0)) > 1.5
                     and p.get("volume_usdt", 0) > 8_000_000
                     and p["symbol"].endswith("USDT")
+                    and p["symbol"].isascii()
                 ][:10]
                 cache["pairs"] = hot
                 cache["last_update"] = now
