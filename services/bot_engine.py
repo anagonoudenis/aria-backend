@@ -20,12 +20,15 @@ logger = get_logger(__name__)
 INTERVAL_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
 BINANCE_FEE      = 0.001
 
-# 17 paires liquides — couvre bull ET bear market
+# 25 paires liquides — couvre bull, bear ET range market
 SCAN_PAIRS = [
     "BNBUSDT",  "SOLUSDT",  "XRPUSDT",  "ADAUSDT",
     "LTCUSDT",  "TRXUSDT",  "LINKUSDT",
     "ETHUSDT",  "SHIBUSDT", "UNIUSDT",  "ATOMUSDT", "NEARUSDT",
     "APTUSDT",  "ARBUSDT",  "OPUSDT",   "INJUSDT",  "SUIUSDT",
+    # Nouvelles paires — secteurs DeFi, AI, Layer2, memes
+    "MATICUSDT", "LDOUSDT",  "FTMUSDT",  "FETUSDT",
+    "TIAUSDT",   "WIFUSDT",  "JUPUSDT",  "RNDRUSDT",
 ]
 # Paires nécessitant min notional $10 — exclues si capital < $15
 HIGH_NOTIONAL_PAIRS = {"BTCUSDT", "ETHUSDT"}
@@ -45,19 +48,28 @@ TAKE_PROFIT_PCT    = 2.5   # TP défaut — ratio 2.8:1
 
 
 # ── Filtres BULL market (BTC > EMA21) ────────────────────────────────────────
-MIN_CONFIDENCE_BULL      = 0.72   # 72% — exige signal de qualité
-MIN_COMPOSITE_SCORE_BULL = 6.0    # score×conf×bonus ≥ 6.0 (était 3.5)
-MIN_SCORE_RAW_BULL       = 7      # 7/15 minimum (était 5)
+MIN_CONFIDENCE_BULL      = 0.68   # 68% — assoupli pour capturer plus de signaux (était 0.72)
+MIN_COMPOSITE_SCORE_BULL = 4.5    # score×conf×bonus ≥ 4.5 (était 6.0 — trop restrictif)
+MIN_SCORE_RAW_BULL       = 6      # 6/15 minimum (était 7)
 MIN_ADX_BULL             = 20     # ADX ≥ 20 = tendance réelle
 MIN_VOLUME_RATIO_BULL    = 1.5    # volume 1.5x la moyenne
 
 # ── Filtres BEAR market (BTC < EMA21) — rebonds oversold uniquement ──────────
-MIN_CONFIDENCE_BEAR      = 0.70   # 70% en bear
-MIN_COMPOSITE_SCORE_BEAR = 6.5    # seuil strict en bear (était 4.0)
-MIN_SCORE_RAW_BEAR       = 7      # 7/15 minimum (était 5)
+MIN_CONFIDENCE_BEAR      = 0.68   # 68% en bear (était 0.70)
+MIN_COMPOSITE_SCORE_BEAR = 5.0    # seuil bear (était 6.5 — trop restrictif)
+MIN_SCORE_RAW_BEAR       = 6      # 6/15 minimum (était 7)
 MIN_ADX_BEAR             = 15     # ADX ≥ 15 en bear
 MIN_VOLUME_RATIO_BEAR    = 1.2    # volume 1.2x
 RSI_OVERSOLD_BEAR        = 42     # RSI < 42 — vrai oversold (était 45)
+
+# ── Filtres RANGE market (ADX_BTC < 18) — stratégie rebonds sur support/BB ──
+MIN_CONFIDENCE_RANGE      = 0.62   # 62% — adapté aux signaux range moins intenses
+MIN_COMPOSITE_SCORE_RANGE = 3.5    # composite bas — range calme
+MIN_SCORE_RAW_RANGE       = 5      # 5/15 minimum (moins strict qu'en BULL)
+MIN_ADX_RANGE             = 8      # ADX bas autorisé — range = pas de tendance macro
+MIN_VOLUME_RATIO_RANGE    = 0.6    # volume faible = normal en consolidation
+RSI_MAX_RANGE             = 52     # RSI < 52 pour acheter (zone inférieure range)
+BB_PCT_MAX_RANGE          = 0.40   # bb_pct < 0.40 = prix dans tiers inférieur BB
 
 # Aliases (compatibilité)
 MIN_CONFIDENCE      = MIN_CONFIDENCE_BULL
@@ -67,7 +79,7 @@ MIN_ADX             = MIN_ADX_BULL
 MIN_VOLUME_RATIO    = MIN_VOLUME_RATIO_BULL
 MAX_CONSECUTIVE_LOSSES   = 5        # pause après 5 pertes (était 6)
 SL_COOLDOWN_SECONDS      = 30 * 60  # 30 min cooldown par paire après SL
-MIN_TRADE_INTERVAL_SECS  = 25 * 60  # 25 min minimum entre deux trades
+MIN_TRADE_INTERVAL_SECS  = 15 * 60  # 15 min minimum entre deux trades (était 25 min)
 DAILY_MAX_LOSS_PCT        = 3.0     # stoppe si perte journalière > 3% (était 4%)
 
 _active_cycles: set = set()
@@ -226,9 +238,9 @@ class BotEngine:
                 logger.warning(f"[{user_id}] Circuit breaker actif — cycle ignore")
                 return
 
-        # ── 0. Filtre horaire — zone morte crypto (3h-6h UTC, liquidité très faible) ──
+        # ── 0. Filtre horaire — creux absolu de liquidité mondiale (4h UTC uniquement) ──
         utc_hour = datetime.now(timezone.utc).hour
-        if 3 <= utc_hour < 6:
+        if utc_hour == 4:   # 1h seulement vs 3h avant — récupère 2h de trading/jour
             logger.info(f"[{user_id}] Zone morte ({utc_hour}h UTC) — cycle skip")
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
@@ -396,6 +408,17 @@ class BotEngine:
                     bot_info["cycles_count"] += 1
                     bot_info["last_cycle_at"] = datetime.now(timezone.utc)
                     return
+        elif market_mode == "RANGE":
+            min_conf  = MIN_CONFIDENCE_RANGE
+            min_score = MIN_COMPOSITE_SCORE_RANGE
+            # RANGE : acheter uniquement en zone basse (RSI < RSI_MAX_RANGE = 52)
+            if not is_btd:
+                rsi_chk = indicators.get("momentum", {}).get("rsi", 50)
+                if rsi_chk > RSI_MAX_RANGE:
+                    logger.info(f"[{user_id}] RANGE RSI {rsi_chk:.1f} > {RSI_MAX_RANGE} — hors zone achat range, ignore")
+                    bot_info["cycles_count"] += 1
+                    bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+                    return
         else:  # NEUTRAL
             min_conf  = MIN_CONFIDENCE_BEAR   # utiliser seuils BEAR (conservative)
             min_score = MIN_COMPOSITE_SCORE_BEAR
@@ -422,9 +445,8 @@ class BotEngine:
         market_regime = signal_data.get("market_regime", "RANGING")
         tf_alignment  = signal_data.get("timeframe_alignment", "MODERATE")
 
-        # TRENDING_DOWN bloqué seulement si pas un buy_the_dip
-        # (buy_the_dip entre précisément dans une tendance baissière pour un rebond)
-        if market_regime == "TRENDING_DOWN" and not is_btd:
+        # TRENDING_DOWN bloqué sauf buy_the_dip ou RANGE (oscillations = normal en consolidation)
+        if market_regime == "TRENDING_DOWN" and not is_btd and market_mode != "RANGE":
             logger.info(f"[{user_id}] TRENDING_DOWN sans BTD — trade refuse")
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
@@ -449,22 +471,31 @@ class BotEngine:
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # ── 10. SL/TP — ratio 3:1 garanti ────────────────────────────────────
+        # ── 10. SL/TP — ATR dynamique, adapté au market_mode ────────────────
         conf = signal_data["confidence"]
         atr = indicators.get("volatility", {}).get("atr", 0)
         if atr > 0 and current_price > 0:
             raw_sl = (1.0 * atr / current_price) * 100
             raw_tp = (3.0 * atr / current_price) * 100
-            # SL [0.7%-1.0%] — plafonné à 1.0% pour limiter les pertes max, TP [2.0%-5.0%]
-            sl_pct = round(max(min(raw_sl, 1.0), 0.7), 3)
-            tp_pct = round(max(min(raw_tp, 5.0), max(2.0, sl_pct * 2.8)), 3)
+            if market_mode == "RANGE":
+                # RANGE : ATR naturellement petit — cibles resserrées, R:R 2.5:1 maintenu
+                sl_pct = round(max(min(raw_sl, 0.7), 0.35), 3)   # SL [0.35%, 0.7%]
+                tp_pct = round(max(min(raw_tp, 2.5), max(0.9, sl_pct * 2.5)), 3)  # TP [0.9%, 2.5%]
+            else:
+                # Tendance (BULL/BEAR/NEUTRAL) : SL [0.7%-1.0%], TP [2.0%-5.0%]
+                sl_pct = round(max(min(raw_sl, 1.0), 0.7), 3)
+                tp_pct = round(max(min(raw_tp, 5.0), max(2.0, sl_pct * 2.8)), 3)
             logger.info(
-                f"[{user_id}] ATR SL={sl_pct}% TP={tp_pct}% ratio={tp_pct/sl_pct:.1f}:1 conf={conf:.0%}"
+                f"[{user_id}] ATR SL={sl_pct}% TP={tp_pct}% ratio={tp_pct/sl_pct:.1f}:1 conf={conf:.0%} [{market_mode}]"
             )
         else:
-            sl_pct = STOP_LOSS_PCT    # 0.9%
-            tp_pct = TAKE_PROFIT_PCT  # 2.5%
-            logger.info(f"[{user_id}] Default SL={sl_pct}% TP={tp_pct}%")
+            if market_mode == "RANGE":
+                sl_pct = 0.5   # SL serré en range (ATR indisponible)
+                tp_pct = 1.3   # TP modéré en range — R:R 2.6:1
+            else:
+                sl_pct = STOP_LOSS_PCT    # 0.9%
+                tp_pct = TAKE_PROFIT_PCT  # 2.5%
+            logger.info(f"[{user_id}] Default SL={sl_pct}% TP={tp_pct}% [{market_mode}]")
 
         # Vérification R:R minimal (sécurité absolue)
         if tp_pct / sl_pct < 2.2:
@@ -532,8 +563,9 @@ class BotEngine:
         )
 
         # ── 12. Pullback entry — attendre EMA9 si prix trop haut ─────────────
+        # Non applicable en RANGE : on achète au bas de BB, pas besoin d'attendre EMA9
         ema9 = indicators.get("trend", {}).get("ema_9", 0)
-        if ema9 > 0 and current_price > ema9 * 1.003:
+        if ema9 > 0 and current_price > ema9 * 1.003 and market_mode != "RANGE":
             # Prix > EMA9 + 0.3% → attendre un pullback vers EMA9
             bot_info["pending_entry"] = {
                 "symbol":        symbol,
@@ -595,9 +627,14 @@ class BotEngine:
             btc_close = candles[-1]["close"] if candles else 0
             ema21     = trend.get("ema_21", 0)
             sma50     = trend.get("sma_50", 0)
+            adx_btc   = trend.get("adx", 0)
 
             if btc_close <= 0 or ema21 <= 0:
                 return "NEUTRAL", "donnees BTC indisponibles"
+
+            # RANGE : ADX BTC < 18 = pas de tendance macro — stratégie rebonds sur support/BB
+            if adx_btc > 0 and adx_btc < 18:
+                return "RANGE", f"BTC ADX={adx_btc:.1f} < 18 — consolidation, stratégie range activée"
 
             if btc_close > ema21 and (sma50 == 0 or ema21 > sma50):
                 return "BULL", f"BTC {btc_close:.0f} > EMA21 {ema21:.0f}"
@@ -714,17 +751,18 @@ class BotEngine:
         if last is None or (now - last).total_seconds() > 900:
             try:
                 all_pairs = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: binance_service.get_top_pairs(min_volume_usdt=10_000_000)
+                    None, lambda: binance_service.get_top_pairs(min_volume_usdt=8_000_000)
                 )
-                # Paires à forte variation + volume élevé + pas déjà dans SCAN_PAIRS
+                # Hot pairs : variation > 1.5% + volume > 8M — seuils assouplis pour plus d'opportunités
                 scan_set = set(SCAN_PAIRS)
                 hot = [
-                    p["symbol"] for p in all_pairs[:100]
+                    p["symbol"] for p in all_pairs[:150]
                     if p["symbol"] not in scan_set
-                    and abs(p.get("change_pct", 0)) > 2.5
-                    and p.get("volume_usdt", 0) > 20_000_000
+                    and p["symbol"] not in BANNED_PAIRS
+                    and abs(p.get("change_pct", 0)) > 1.5
+                    and p.get("volume_usdt", 0) > 8_000_000
                     and p["symbol"].endswith("USDT")
-                ][:6]
+                ][:10]
                 cache["pairs"] = hot
                 cache["last_update"] = now
                 if hot:
@@ -802,7 +840,9 @@ class BotEngine:
             rsi        = momentum.get("rsi", 50)
             adx        = trend_5m.get("adx", 0)
             vol_ratio  = volume_ind.get("vol_ratio", 1.0)
-            macd_h     = trend_5m.get("macd_histogram", 0)
+            macd_h        = trend_5m.get("macd_histogram", 0)
+            volatility_ind = indicators_5m.get("volatility", {})
+            bb_pct_5m      = volatility_ind.get("bb_pct", 0.5)
 
             # ── Déterminer le signal effectif ────────────────────────────
             effective_action = action_5m
@@ -822,6 +862,9 @@ class BotEngine:
                     btd = (action_15m == "BUY" and action_1h == "BUY" and rsi < 50)
                 elif market_mode == "BEAR":
                     btd = ((action_15m == "BUY" or action_1h == "BUY") and rsi < 40)
+                elif market_mode == "RANGE":
+                    # RANGE : RSI très oversold + bas de BB = rebond probable même sans TF haussier
+                    btd = (rsi < 32 and bb_pct_5m < 0.20)
                 else:  # NEUTRAL
                     btd = ((action_15m == "BUY" or action_1h == "BUY") and rsi < 50)
                 if btd:
@@ -835,7 +878,12 @@ class BotEngine:
                 continue
 
             # ── Score minimum ─────────────────────────────────────────────
-            min_raw = MIN_SCORE_RAW_BEAR if market_mode == "BEAR" else MIN_SCORE_RAW_BULL
+            if market_mode == "BEAR":
+                min_raw = MIN_SCORE_RAW_BEAR
+            elif market_mode == "RANGE":
+                min_raw = MIN_SCORE_RAW_RANGE
+            else:
+                min_raw = MIN_SCORE_RAW_BULL
             if effective_score < min_raw:
                 logger.info(f"[{user_id}] {sym}: score {effective_score} < {min_raw} ({market_mode}) — skip")
                 continue
@@ -843,7 +891,12 @@ class BotEngine:
             # ── Filtres qualité pour BUY ──────────────────────────────────
             if effective_action == "BUY":
                 # ADX minimum
-                adx_min = MIN_ADX_BEAR if market_mode == "BEAR" else MIN_ADX_BULL
+                if market_mode == "BEAR":
+                    adx_min = MIN_ADX_BEAR
+                elif market_mode == "RANGE":
+                    adx_min = MIN_ADX_RANGE
+                else:
+                    adx_min = MIN_ADX_BULL
                 if adx < adx_min:
                     logger.info(f"[{user_id}] {sym}: ADX={adx:.1f} < {adx_min} ({market_mode}) — skip")
                     continue
@@ -862,7 +915,12 @@ class BotEngine:
 
                 # Volume minimum — BTD = pullback naturellement à faible volume
                 is_btd_signal = (action_5m != "BUY" and effective_action == "BUY")
-                vol_min = 0.8 if is_btd_signal else (1.5 if market_mode == "BULL" else 1.2)
+                if market_mode == "RANGE":
+                    vol_min = 0.5 if is_btd_signal else MIN_VOLUME_RATIO_RANGE  # range = volume faible normal
+                elif market_mode == "BULL":
+                    vol_min = 0.8 if is_btd_signal else 1.5
+                else:  # BEAR / NEUTRAL
+                    vol_min = 0.8 if is_btd_signal else 1.2
                 if vol_ratio < vol_min:
                     logger.info(f"[{user_id}] {sym}: vol={vol_ratio:.1f}x < {vol_min}x ({market_mode}) — skip")
                     continue
@@ -875,6 +933,14 @@ class BotEngine:
                 elif market_mode == "BULL":
                     if not (28 <= rsi <= 72):
                         logger.debug(f"{sym}: BULL RSI={rsi:.1f} hors 28-72 — skip")
+                        continue
+                elif market_mode == "RANGE":
+                    if rsi > RSI_MAX_RANGE:
+                        logger.info(f"[{user_id}] {sym}: RANGE RSI={rsi:.1f} > {RSI_MAX_RANGE} — hors zone achat range, skip")
+                        continue
+                    # RANGE : exiger zone basse BB OU RSI très oversold pour rebond fiable
+                    if bb_pct_5m > BB_PCT_MAX_RANGE and rsi > 38:
+                        logger.info(f"[{user_id}] {sym}: RANGE bb_pct={bb_pct_5m:.2f}>{BB_PCT_MAX_RANGE} RSI={rsi:.1f}>38 — hors zone rebond, skip")
                         continue
                 else:
                     if not (25 <= rsi <= 75):
@@ -911,13 +977,13 @@ class BotEngine:
                     logger.debug(f"{sym}: triple SELL — skip")
                     continue
 
-                # 15m confirmation bloquante — si 15m dit SELL, on n'achète pas sur 5m
-                # La 15m est 3x plus fiable que la 5m pour la direction
-                if action_5m == "BUY" and action_15m == "SELL":
+                # 15m confirmation bloquante — relaxé en RANGE (oscillations normales dans le range)
+                if action_5m == "BUY" and action_15m == "SELL" and market_mode != "RANGE":
                     logger.info(f"[{user_id}] {sym}: 5m BUY mais 15m SELL — contre-tendance, skip")
                     continue
 
                 # Anti-pump : éviter les entrées tardives (prix +7% sur 1h)
+                # Anti-dump : éviter couperet en chute (> -8% sur 1h) sauf RANGE oversold
                 if len(candles) >= 12:
                     price_1h_ago = candles[-12].get("close", 0)
                     if price_1h_ago > 0:
@@ -925,13 +991,14 @@ class BotEngine:
                         if move_1h > 7.0:
                             logger.info(f"[{user_id}] {sym}: pump +{move_1h:.1f}% (1h) — entrée tardive, skip")
                             continue
-                        if move_1h < -8.0:
+                        # En RANGE : dump -8% = opportunité de rebond si RSI oversold (< 40)
+                        if move_1h < -8.0 and not (market_mode == "RANGE" and rsi < 40):
                             logger.info(f"[{user_id}] {sym}: dump {move_1h:.1f}% (1h) — skip BUY")
                             continue
 
                 # Confirmation bougie fermée au-dessus EMA9 — BUY classiques uniquement
-                # (Ne s'applique PAS aux buy_the_dip : par définition le prix est sous EMA9)
-                if action_5m == "BUY":
+                # Non applicable : buy_the_dip = sous EMA9, RANGE = achat au bas de BB
+                if action_5m == "BUY" and market_mode != "RANGE":
                     ema9_chk  = trend_5m.get("ema_9", 0)
                     close_chk = candles[-1]["close"] if candles else 0
                     if ema9_chk > 0 and close_chk > 0 and close_chk < ema9_chk * 0.998:
@@ -1020,16 +1087,23 @@ class BotEngine:
                 signal_data["action"]     = "BUY"
                 signal_data["confidence"] = max(signal_data.get("confidence", 0.65), 0.66)
                 logger.info(f"[{user_id}] Buy-the-dip override (1h BUY): {sym} → BUY {signal_data['confidence']:.0%}")
+            elif market_mode == "RANGE" and rule_score >= 7:
+                # RANGE : RSI très oversold + bas BB = rebond probable, 1h non requis
+                signal_data["action"]     = "BUY"
+                signal_data["confidence"] = max(signal_data.get("confidence", 0.60), 0.63)
+                logger.info(f"[{user_id}] Buy-the-dip RANGE override: {sym} → BUY {signal_data['confidence']:.0%} (RSI oversold + BB bas)")
             else:
-                logger.info(f"[{user_id}] Buy-the-dip override annulé: 1h={best_candidate.get('confluence_1h')} score={rule_score}")
+                logger.info(f"[{user_id}] Buy-the-dip override annulé: 1h={best_candidate.get('confluence_1h')} score={rule_score} mode={market_mode}")
 
         bonus = 1.5 if best_candidate.get("triple_bull") else (1.2 if best_candidate.get("buy_the_dip") else 1.0)
         composite = round(best_candidate["score"] * signal_data["confidence"] * bonus, 2)
 
+        _seuil_log = (MIN_COMPOSITE_SCORE_RANGE if market_mode == "RANGE" else
+                      (MIN_COMPOSITE_SCORE_BEAR  if market_mode == "BEAR"  else MIN_COMPOSITE_SCORE_BULL))
         logger.info(
             f"[{user_id}] Composite: {sym} "
             f"score={best_candidate['score']} × conf={signal_data['confidence']:.2f} "
-            f"× bonus={bonus} = {composite:.2f} (seuil={MIN_COMPOSITE_SCORE_BULL if market_mode!='BEAR' else MIN_COMPOSITE_SCORE_BEAR})"
+            f"× bonus={bonus} = {composite:.2f} (seuil={_seuil_log} [{market_mode}])"
         )
 
         return {
@@ -1174,13 +1248,13 @@ class BotEngine:
         # Trailing step adaptatif : plus serré quand on est bien en profit (lock gains)
         adx_entry  = float(trade.get("signal_adx", 0) or 0)
         if pnl_pct >= 2.0:
-            trail_step = 0.20   # > +2% : trail très serré — protège presque tout
+            trail_step = TRAIL_STEP_PCT  # 0.20% — très serré — protège presque tout
         elif pnl_pct >= 1.5:
             trail_step = 0.25   # > +1.5% : trail serré
         elif adx_entry > 35:
             trail_step = 0.30   # tendance forte à l'entrée
         else:
-            trail_step = TRAIL_STEP_PCT  # 0.35% par défaut
+            trail_step = 0.35   # position naissante — marge contre le bruit
 
         # Mettre à jour le plus haut
         updates = {}
