@@ -33,23 +33,23 @@ SCAN_PAIRS = [
 # Paires nécessitant min notional $10 — exclues si capital < $15
 HIGH_NOTIONAL_PAIRS = {"BTCUSDT", "ETHUSDT"}
 # Paires à 0% WR sur 5+ trades — exclues du scan et des hot pairs
-BANNED_PAIRS = {"DOGEUSDT", "AVAXUSDT", "DOTUSDT"}
+BANNED_PAIRS = {"DOGEUSDT", "AVAXUSDT", "DOTUSDT", "BNBUSDT"}
 # Paires avec historique difficile — seuils ADX/score renforcés
 PAIR_EXTRA_FILTERS: Dict[str, Dict] = {
     "BNBUSDT": {"min_adx_bonus": 5, "min_score_bonus": 1},
 }
 
 # TP/SL — ratio 3:1
-TRAIL_TRIGGER_PCT  = 0.8   # trailing SL activé dès +0.8% profit
-TRAIL_STEP_PCT     = 0.20  # SL trail = highest × (1 - 0.20%) — plus serré pour locker les gains
-BREAKEVEN_PCT      = 0.3   # SL → entrée dès +0.3% (était 0.5%)
+TRAIL_TRIGGER_PCT  = 1.2   # trailing SL activé dès +1.2% profit (était 0.8 — trop tôt)
+TRAIL_STEP_PCT     = 0.35  # SL trail = highest × (1 - 0.35%) — assez serré mais respire face au bruit
+BREAKEVEN_PCT      = 1.5   # SL → entrée dès +1.5% — laisse respirer le trade (était 0.3 — trop agressif)
 STOP_LOSS_PCT      = 0.9   # SL défaut légèrement plus large (évite faux triggers)
 TAKE_PROFIT_PCT    = 2.5   # TP défaut — ratio 2.8:1
 
 
 # ── Filtres BULL market (BTC > EMA21) ────────────────────────────────────────
 MIN_CONFIDENCE_BULL      = 0.68   # 68% — assoupli pour capturer plus de signaux (était 0.72)
-MIN_COMPOSITE_SCORE_BULL = 4.5    # score×conf×bonus ≥ 4.5 (était 6.0 — trop restrictif)
+MIN_COMPOSITE_SCORE_BULL = 6.0    # score×conf×bonus ≥ 6.0 — qualité minimale réelle
 MIN_SCORE_RAW_BULL       = 6      # 6/15 minimum (était 7)
 MIN_ADX_BULL             = 20     # ADX ≥ 20 = tendance réelle
 MIN_VOLUME_RATIO_BULL    = 1.5    # volume 1.5x la moyenne
@@ -64,7 +64,7 @@ RSI_OVERSOLD_BEAR        = 42     # RSI < 42 — vrai oversold (était 45)
 
 # ── Filtres RANGE market (ADX_BTC < 18) — stratégie rebonds sur support/BB ──
 MIN_CONFIDENCE_RANGE      = 0.62   # 62% — adapté aux signaux range moins intenses
-MIN_COMPOSITE_SCORE_RANGE = 3.5    # composite bas — range calme
+MIN_COMPOSITE_SCORE_RANGE = 5.0    # composite relevé — range génère trop de faux signaux à 3.5
 MIN_SCORE_RAW_RANGE       = 5      # 5/15 minimum (moins strict qu'en BULL)
 MIN_ADX_RANGE             = 8      # ADX bas autorisé — range = pas de tendance macro
 MIN_VOLUME_RATIO_RANGE    = 0.6    # volume faible = normal en consolidation
@@ -77,10 +77,10 @@ MIN_COMPOSITE_SCORE = MIN_COMPOSITE_SCORE_BULL
 MIN_SCORE_RAW       = MIN_SCORE_RAW_BULL
 MIN_ADX             = MIN_ADX_BULL
 MIN_VOLUME_RATIO    = MIN_VOLUME_RATIO_BULL
-MAX_CONSECUTIVE_LOSSES   = 5        # pause après 5 pertes (était 6)
-SL_COOLDOWN_SECONDS      = 30 * 60  # 30 min cooldown par paire après SL
-MIN_TRADE_INTERVAL_SECS  = 15 * 60  # 15 min minimum entre deux trades (était 25 min)
-DAILY_MAX_LOSS_PCT        = 3.0     # stoppe si perte journalière > 3% (était 4%)
+MAX_CONSECUTIVE_LOSSES   = 4        # pause après 4 pertes consécutives
+SL_COOLDOWN_SECONDS      = 45 * 60  # 45 min cooldown par paire après SL (était 30 min)
+MIN_TRADE_INTERVAL_SECS  = 25 * 60  # 25 min minimum entre deux trades (était 15 min)
+DAILY_MAX_LOSS_PCT        = 2.0     # stoppe si perte journalière > 2% (était 3%)
 
 _active_cycles: set = set()
 
@@ -238,9 +238,9 @@ class BotEngine:
                 logger.warning(f"[{user_id}] Circuit breaker actif — cycle ignore")
                 return
 
-        # ── 0. Filtre horaire — creux absolu de liquidité mondiale (4h UTC uniquement) ──
+        # ── 0. Filtre horaire — zone morte mondiale 02h-06h UTC (volume ultra-faible = faux signaux) ──
         utc_hour = datetime.now(timezone.utc).hour
-        if utc_hour == 4:   # 1h seulement vs 3h avant — récupère 2h de trading/jour
+        if 2 <= utc_hour <= 6:
             logger.info(f"[{user_id}] Zone morte ({utc_hour}h UTC) — cycle skip")
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
@@ -576,7 +576,7 @@ class BotEngine:
                 "tp_pct":        tp_pct,
                 "config":        config,
                 "created_at":    datetime.now(timezone.utc),
-                "expires_at":    datetime.now(timezone.utc) + timedelta(minutes=5),
+                "expires_at":    datetime.now(timezone.utc) + timedelta(minutes=15),
             }
             logger.info(
                 f"[{user_id}] Pullback pending {symbol}: "
@@ -891,15 +891,18 @@ class BotEngine:
 
             # ── Filtres qualité pour BUY ──────────────────────────────────
             if effective_action == "BUY":
-                # ADX minimum
+                # ADX minimum — abaissé pour OVERSOLD EXTREME (RSI<20) car flash crash = ADX naturellement bas
+                is_extreme_oversold = (rsi < 20)
                 if market_mode == "BEAR":
                     adx_min = MIN_ADX_BEAR
                 elif market_mode == "RANGE":
                     adx_min = MIN_ADX_RANGE
+                elif is_extreme_oversold:
+                    adx_min = 12  # flash crash : pas de tendance mais rebond quasi-certain
                 else:
                     adx_min = MIN_ADX_BULL
                 if adx < adx_min:
-                    logger.info(f"[{user_id}] {sym}: ADX={adx:.1f} < {adx_min} ({market_mode}) — skip")
+                    logger.info(f"[{user_id}] {sym}: ADX={adx:.1f} < {adx_min} ({market_mode}{'  EXTREME' if is_extreme_oversold else ''}) — skip")
                     continue
 
                 # Filtres renforcés pour paires à historique difficile
@@ -915,9 +918,12 @@ class BotEngine:
                         continue
 
                 # Volume minimum — BTD = pullback naturellement à faible volume
+                # EXTREME OVERSOLD (RSI<20) = flash crash, volume faible = normal
                 is_btd_signal = (action_5m != "BUY" and effective_action == "BUY")
                 if market_mode == "RANGE":
-                    vol_min = 0.5 if is_btd_signal else MIN_VOLUME_RATIO_RANGE  # range = volume faible normal
+                    vol_min = 0.5 if is_btd_signal else MIN_VOLUME_RATIO_RANGE
+                elif is_extreme_oversold:
+                    vol_min = 0.5   # flash crash recovery : volume toujours faible pendant le crash
                 elif market_mode == "BULL":
                     vol_min = 0.8 if is_btd_signal else 1.5
                 else:  # BEAR / NEUTRAL
@@ -932,8 +938,14 @@ class BotEngine:
                         logger.debug(f"{sym}: BEAR RSI={rsi:.1f} > 58 — skip")
                         continue
                 elif market_mode == "BULL":
-                    if not (28 <= rsi <= 72):
-                        logger.debug(f"{sym}: BULL RSI={rsi:.1f} hors 28-72 — skip")
+                    # Suracheté → toujours refuser
+                    if rsi > 72:
+                        logger.debug(f"{sym}: BULL RSI={rsi:.1f} > 72 (suracheté) — skip")
+                        continue
+                    # RSI 20-27 sans contexte extrême → refuser (signal faible)
+                    # RSI < 20 (is_extreme_oversold) → autoriser (flash crash recovery)
+                    if rsi < 28 and not is_extreme_oversold:
+                        logger.debug(f"{sym}: BULL RSI={rsi:.1f} < 28 non-extreme — skip")
                         continue
                 elif market_mode == "RANGE":
                     if rsi > RSI_MAX_RANGE:
@@ -1088,11 +1100,6 @@ class BotEngine:
                 signal_data["action"]     = "BUY"
                 signal_data["confidence"] = max(signal_data.get("confidence", 0.65), 0.66)
                 logger.info(f"[{user_id}] Buy-the-dip override (1h BUY): {sym} → BUY {signal_data['confidence']:.0%}")
-            elif market_mode == "RANGE" and rule_score >= 7:
-                # RANGE : RSI très oversold + bas BB = rebond probable, 1h non requis
-                signal_data["action"]     = "BUY"
-                signal_data["confidence"] = max(signal_data.get("confidence", 0.60), 0.63)
-                logger.info(f"[{user_id}] Buy-the-dip RANGE override: {sym} → BUY {signal_data['confidence']:.0%} (RSI oversold + BB bas)")
             else:
                 logger.info(f"[{user_id}] Buy-the-dip override annulé: 1h={best_candidate.get('confluence_1h')} score={rule_score} mode={market_mode}")
 
@@ -1246,10 +1253,21 @@ class BotEngine:
 
         pnl_pct = (price - entry) / entry * 100
 
+        # ── PARTIAL TP : à +1.5%, ferme 50% et monte SL au breakeven ────────
+        partial_tp_price    = float(trade.get("partial_tp_price", 0))
+        partial_tp_executed = bool(trade.get("partial_tp_executed", False))
+        if partial_tp_price > 0 and not partial_tp_executed and price >= partial_tp_price:
+            logger.info(
+                f"[{user_id}] Partial TP {trade.get('symbol','')}: "
+                f"prix={price:.4f} >= cible={partial_tp_price:.4f} (+1.5%) — fermeture 50%"
+            )
+            await self._partial_close_position(user_id, trade, price)
+            return
+
         # Trailing step adaptatif : plus serré quand on est bien en profit (lock gains)
         adx_entry  = float(trade.get("signal_adx", 0) or 0)
         if pnl_pct >= 2.0:
-            trail_step = TRAIL_STEP_PCT  # 0.20% — très serré — protège presque tout
+            trail_step = TRAIL_STEP_PCT  # 0.35% — lock les gains sans trigger sur le bruit
         elif pnl_pct >= 1.5:
             trail_step = 0.25   # > +1.5% : trail serré
         elif adx_entry > 35:
@@ -1263,7 +1281,7 @@ class BotEngine:
             updates["highest_price_seen"] = price
             highest = price
 
-        # ── BREAKEVEN : dès +0.5%, SL monte à l'entrée + 0.1% ───────────────
+        # ── BREAKEVEN : dès +1.5%, SL monte à l'entrée + 0.1% ───────────────
         if pnl_pct >= BREAKEVEN_PCT and sl_price < entry:
             new_sl = round(entry * 1.001, 8)
             updates["stop_loss_price"] = new_sl
@@ -1401,6 +1419,8 @@ class BotEngine:
             "signal_confidence":   signal_data["confidence"],
             "signal_source":       signal_data.get("source", "claude"),
             "signal_adx":          (indicators or {}).get("trend", {}).get("adx", 0),
+            "partial_tp_price":    round(ex_price * 1.015, 8),  # TP partiel à +1.5%
+            "partial_tp_executed": False,
         })
 
         trade_id = None
@@ -1435,6 +1455,108 @@ class BotEngine:
         })
         await self._broadcast(user_id, "portfolio_update", updated)
         return True
+
+    async def _partial_close_position(
+        self, user_id: str, trade: dict, close_price: float, fraction: float = 0.50
+    ) -> None:
+        """Ferme 50% de la position au TP partiel — protège le capital, laisse le reste courir."""
+        db     = get_database()
+        symbol = trade.get("symbol", "")
+        entry  = float(trade.get("price", 0))
+        cost   = float(trade.get("total_usdt", 0))
+        qty    = float(trade.get("quantity", 0))
+
+        # ── Lock atomique — empêche double-exécution si monitor + cycle tournent en même temps ──
+        lock_result = await db.trades.update_one(
+            {"_id": trade["_id"], "partial_tp_executed": False},
+            {"$set": {"partial_tp_executed": True}},
+        )
+        if lock_result.modified_count == 0:
+            logger.info(f"[{user_id}] Partial TP {symbol} déjà verrouillé — skip concurrent")
+            return
+
+        try:
+            base = symbol.replace("USDT", "").replace("BUSD", "")
+            bals = await asyncio.get_event_loop().run_in_executor(
+                None, binance_service.get_account_balance
+            )
+            avail = float(bals.get(base, {}).get("free", 0.0))
+            if avail <= 0:
+                logger.warning(f"[{user_id}] Pas de {base} pour partial TP — skip")
+                # Rollback le lock si pas de balance
+                await db.trades.update_one(
+                    {"_id": trade["_id"]}, {"$set": {"partial_tp_executed": False}}
+                )
+                return
+            from decimal import Decimal, ROUND_DOWN
+            info     = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: binance_service.get_symbol_info(symbol)
+            )
+            step     = Decimal(info["step_size"])
+            sell_qty = float((Decimal(str(avail * fraction)) // step) * step)
+            if sell_qty <= 0:
+                await db.trades.update_one(
+                    {"_id": trade["_id"]}, {"$set": {"partial_tp_executed": False}}
+                )
+                return
+        except Exception as e:
+            logger.error(f"[{user_id}] Partial TP balance check {symbol}: {e}")
+            await db.trades.update_one(
+                {"_id": trade["_id"]}, {"$set": {"partial_tp_executed": False}}
+            )
+            return
+
+        try:
+            order      = await asyncio.get_event_loop().run_in_executor(
+                None, lambda q=sell_qty: binance_service.place_market_order(symbol, "SELL", q)
+            )
+            fills      = order.get("fills", [])
+            sell_price = float(fills[0]["price"]) if fills else close_price
+            gross      = sell_qty * sell_price
+            fee        = gross * BINANCE_FEE
+            net        = gross - fee
+            partial_cost    = cost * fraction
+            partial_pnl     = net - partial_cost
+            partial_pnl_pct = (partial_pnl / partial_cost * 100) if partial_cost > 0 else 0
+
+            # SL : garde le meilleur entre breakeven et le trailing SL existant
+            # (si trailing déjà à +1.14%, ne pas le dégrader à +0.1%)
+            breakeven_sl = round(entry * 1.001, 8)
+            current_sl   = float(trade.get("stop_loss_price", 0) or 0)
+            new_sl       = max(breakeven_sl, current_sl)  # toujours le plus haut des deux
+
+            # partial_tp_executed est déjà True (posé par le lock atomique ci-dessus)
+            update_fields = {
+                "partial_tp_price_executed":  sell_price,
+                "partial_pnl":                round(partial_pnl, 6),
+                "total_usdt":                 round(cost * (1 - fraction), 6),
+                "quantity":                   round(qty * (1 - fraction), 8),
+                "stop_loss_price":            new_sl,
+            }
+            await db.trades.update_one(
+                {"_id": trade["_id"]},
+                {"$set": update_fields},
+            )
+
+            sl_label = "breakeven" if new_sl == breakeven_sl else "trailing"
+            logger.info(
+                f"[{user_id}] 💰 PARTIAL TP {symbol} @ {sell_price:.4f} "
+                f"PnL={partial_pnl:+.4f} USDT ({partial_pnl_pct:+.2f}%) "
+                f"SL → {sl_label} {new_sl:.4f}"
+            )
+
+            await notification_service.send(user_id, "trade_executed", {
+                "symbol": symbol, "side": "PARTIAL_SELL",
+                "price": sell_price, "pnl": partial_pnl,
+                "pnl_pct": partial_pnl_pct, "reason": "partial_take_profit",
+            })
+
+        except Exception as e:
+            logger.error(f"[{user_id}] Partial close {symbol} failed: {e}")
+            # Rollback le lock si le sell a échoué
+            await db.trades.update_one(
+                {"_id": trade["_id"]}, {"$set": {"partial_tp_executed": False}}
+            )
 
     async def _close_position(
         self, user_id: str, trade: dict, close_price: float, reason: str
@@ -1479,36 +1601,41 @@ class BotEngine:
             fee        = gross * BINANCE_FEE
             net        = gross - fee
             pnl        = net - cost
-            pnl_pct    = (pnl / cost * 100) if cost > 0 else 0
+            # Additionner le gain du TP partiel (50% déjà encaissé) si applicable
+            partial_pnl = float(trade.get("partial_pnl", 0) or 0)
+            total_pnl   = round(pnl + partial_pnl, 6)
+            orig_cost   = cost / (1 - 0.50) if trade.get("partial_tp_executed") else cost
+            pnl_pct     = (total_pnl / orig_cost * 100) if orig_cost > 0 else 0
 
             await db.trades.update_one(
                 {"_id": trade["_id"]},
                 {"$set": {
-                    "status": "CLOSED", "pnl": round(pnl, 6),
+                    "status": "CLOSED", "pnl": total_pnl,
                     "pnl_pct": round(pnl_pct, 4),
                     "closed_at": datetime.utcnow(),
                     "close_price": sell_price, "close_reason": reason,
                 }},
             )
 
-            emoji = "✅" if pnl > 0 else "❌"
+            emoji = "✅" if total_pnl > 0 else "❌"
+            partial_tag = f" (+{partial_pnl:.4f} partial)" if partial_pnl != 0 else ""
             logger.info(
                 f"[{user_id}] {emoji} CLOSE {symbol} @ {sell_price:.4f} "
-                f"PnL={pnl:+.4f} USDT ({pnl_pct:+.2f}%) [{reason}]"
+                f"PnL={total_pnl:+.4f} USDT ({pnl_pct:+.2f}%){partial_tag} [{reason}]"
             )
 
             await notification_service.send(user_id, "trade_executed", {
                 "symbol": symbol, "side": "SELL",
-                "price": sell_price, "pnl": pnl, "pnl_pct": pnl_pct, "reason": reason,
+                "price": sell_price, "pnl": total_pnl, "pnl_pct": pnl_pct, "reason": reason,
             })
             await self._broadcast(user_id, "trade_executed", {
                 "symbol": symbol, "side": "SELL",
-                "price": sell_price, "pnl": pnl, "pnl_pct": pnl_pct, "reason": reason,
+                "price": sell_price, "pnl": total_pnl, "pnl_pct": pnl_pct, "reason": reason,
             })
 
             bot_info = self._running_bots.get(user_id, {})
             bot_info["consecutive_losses"] = (
-                bot_info.get("consecutive_losses", 0) + 1 if pnl < 0 else 0
+                bot_info.get("consecutive_losses", 0) + 1 if total_pnl < 0 else 0
             )
 
             # Cooldown adaptatif par paire : 45min → 3h → 8h selon pertes consécutives
@@ -1522,7 +1649,7 @@ class BotEngine:
                 secs = 8 * 3600 if pair_count >= 3 else (3 * 3600 if pair_count >= 2 else 45 * 60)
                 bot_info["sl_cooldown"][symbol] = datetime.now(timezone.utc) + timedelta(seconds=secs)
                 logger.info(f"[{user_id}] {symbol}: cooldown {secs//60}min ({pair_count} SL consecutifs)")
-            elif pnl > 0:
+            elif total_pnl > 0:
                 # Victoire sur cette paire → reset son compteur de pertes
                 if "pair_losses" in bot_info:
                     bot_info["pair_losses"].pop(symbol, None)
