@@ -22,22 +22,23 @@ BINANCE_FEE      = 0.001
 
 # 25 paires liquides — couvre bull, bear ET range market
 SCAN_PAIRS = [
-    "BNBUSDT",  "SOLUSDT",  "XRPUSDT",  "ADAUSDT",
+    "SOLUSDT",  "XRPUSDT",  "ADAUSDT",
     "LTCUSDT",  "TRXUSDT",  "LINKUSDT",
-    "ETHUSDT",  "SHIBUSDT", "UNIUSDT",  "ATOMUSDT", "NEARUSDT",
+    "ETHUSDT",  "UNIUSDT",  "ATOMUSDT", "NEARUSDT",
     "APTUSDT",  "ARBUSDT",  "OPUSDT",   "INJUSDT",  "SUIUSDT",
-    # Nouvelles paires — secteurs DeFi, AI, Layer2, memes
-    "MATICUSDT", "LDOUSDT",  "FTMUSDT",  "FETUSDT",
-    "TIAUSDT",   "WIFUSDT",  "JUPUSDT",  "RNDRUSDT",
+    "TIAUSDT",  "JUPUSDT",  "FETUSDT",
 ]
 # Paires nécessitant min notional $10 — exclues si capital < $15
 HIGH_NOTIONAL_PAIRS = {"BTCUSDT", "ETHUSDT"}
-# Paires à 0% WR sur 5+ trades — exclues du scan et des hot pairs
-BANNED_PAIRS = {"DOGEUSDT", "AVAXUSDT", "DOTUSDT", "BNBUSDT"}
-# Paires avec historique difficile — seuils ADX/score renforcés
-PAIR_EXTRA_FILTERS: Dict[str, Dict] = {
-    "BNBUSDT": {"min_adx_bonus": 5, "min_score_bonus": 1},
+# Paires bannies définitivement (WR < 20% ou pertes structurelles)
+BANNED_PAIRS = {
+    "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "BNBUSDT",   # anciens losers
+    "SPCXBUSDT", "DEXEUSDT", "WLDUSDT", "HMSTRUSDT", # nouveaux losers jul-13
+    "MUBUSDT", "GRAMUSDT", "OPGUSDT",                # grosses pertes isolées
+    "SHIBUSDT", "MATICUSDT", "LDOUSDT", "FTMUSDT",   # tokens faible qualité
+    "RNDRUSDT", "WIFUSDT",                           # mèmes/hype, WR < 25%
 }
+PAIR_EXTRA_FILTERS: Dict[str, Dict] = {}  # réservé pour futures paires à seuils renforcés
 
 # TP/SL — ratio 3:1
 TRAIL_TRIGGER_PCT  = 1.2   # trailing SL activé dès +1.2% profit (était 0.8 — trop tôt)
@@ -78,9 +79,10 @@ MIN_SCORE_RAW       = MIN_SCORE_RAW_BULL
 MIN_ADX             = MIN_ADX_BULL
 MIN_VOLUME_RATIO    = MIN_VOLUME_RATIO_BULL
 MAX_CONSECUTIVE_LOSSES   = 4        # pause après 4 pertes consécutives
-SL_COOLDOWN_SECONDS      = 45 * 60  # 45 min cooldown par paire après SL (était 30 min)
-MIN_TRADE_INTERVAL_SECS  = 25 * 60  # 25 min minimum entre deux trades (était 15 min)
-DAILY_MAX_LOSS_PCT        = 2.0     # stoppe si perte journalière > 2% (était 3%)
+SL_COOLDOWN_SECONDS      = 45 * 60  # 45 min cooldown par paire après SL
+MIN_TRADE_INTERVAL_SECS  = 30 * 60  # 30 min minimum entre deux trades (était 25)
+DAILY_MAX_LOSS_PCT        = 2.0     # stoppe si perte journalière > 2%
+MAX_DAILY_TRADES          = 7       # max 7 nouveaux trades par jour (évite surtrading)
 
 _active_cycles: set = set()
 
@@ -117,8 +119,10 @@ class BotEngine:
             "sl_cooldown": {},          # {symbol: expiry_datetime} — paires en cooldown après SL
             "pair_losses": {},         # {symbol: count} — SL consécutifs par paire
             "pending_entry": None,     # signal en attente d'un pullback vers EMA9
-            "daily_start_capital": 0.0,  # capital en début de journée UTC
+            "daily_start_capital": 0.0,  # capital en début de journée UTC (legacy)
             "last_day_reset": None,    # date du dernier reset journalier
+            "daily_trade_count": 0,    # trades ouverts aujourd'hui (reset à minuit UTC)
+            "daily_trade_date": None,  # date du compteur
         }
 
         db = get_database()
@@ -257,25 +261,44 @@ class BotEngine:
 
         logger.info(f"[{user_id}] Cycle start — capital={available_usdt:.2f} USDT")
 
-        # ── 2b. Reset journalier + circuit breaker perte journalière ─────────
+        # ── 2b. Perte journalière + max trades — calcul MongoDB (résiste aux restarts) ──
         today = datetime.now(timezone.utc).date()
         total_usdt = portfolio_data.get("total_usdt", available_usdt)
-        if bot_info.get("last_day_reset") != today:
-            bot_info["daily_start_capital"] = total_usdt
-            bot_info["last_day_reset"]       = today
-            logger.info(f"[{user_id}] Nouveau jour — capital de reference: {total_usdt:.2f} USDT")
 
-        daily_start = bot_info.get("daily_start_capital", total_usdt)
-        if daily_start > 0:
-            daily_loss_pct = (daily_start - total_usdt) / daily_start * 100
+        # Reset compteur trades si nouveau jour
+        if bot_info.get("daily_trade_date") != today:
+            bot_info["daily_trade_count"] = 0
+            bot_info["daily_trade_date"]  = today
+
+        # Perte journalière depuis MongoDB — survit aux redéploiements Railway
+        today_utc = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_closed = await db.trades.find(
+            {"user_id": user_id, "status": "CLOSED", "closed_at": {"$gte": today_utc}},
+            {"pnl": 1}
+        ).to_list(200)
+        daily_realized_pnl = sum(float(t.get("pnl") or 0) for t in today_closed)
+
+        if daily_realized_pnl < 0:
+            # Capital estimé en début de journée = capital actuel + pertes réalisées
+            daily_start_est = total_usdt - daily_realized_pnl
+            daily_loss_pct  = abs(daily_realized_pnl) / daily_start_est * 100
             if daily_loss_pct >= DAILY_MAX_LOSS_PCT:
                 logger.warning(
                     f"[{user_id}] Perte journaliere {daily_loss_pct:.1f}% "
-                    f">= {DAILY_MAX_LOSS_PCT}% — pause trading aujourd'hui"
+                    f">= {DAILY_MAX_LOSS_PCT}% (PnL={daily_realized_pnl:+.4f}$) — pause trading aujourd'hui"
                 )
                 bot_info["cycles_count"] += 1
                 bot_info["last_cycle_at"] = datetime.now(timezone.utc)
                 return
+
+        # Max trades par jour — empêche surtrading (ex: 40 trades le 08/07)
+        if bot_info["daily_trade_count"] >= MAX_DAILY_TRADES:
+            logger.info(
+                f"[{user_id}] Max trades journaliers atteint ({bot_info['daily_trade_count']}/{MAX_DAILY_TRADES}) — pause"
+            )
+            bot_info["cycles_count"] += 1
+            bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+            return
 
         if available_usdt < 5.5:
             logger.info(f"[{user_id}] Capital insuffisant ({available_usdt:.2f}) — pas de nouveau trade")
@@ -358,6 +381,7 @@ class BotEngine:
 
         symbol        = best["symbol"]
         signal_data   = best["signal"]
+        signal_data["symbol"] = symbol          # requis par risk_manager (veto TradingAgents + corrélations)
         indicators    = best["indicators"]
         current_price = prices.get(symbol, 0)
 
@@ -590,7 +614,8 @@ class BotEngine:
                 indicators=indicators,
             )
             if buy_ok:
-                bot_info["last_trade_at"] = datetime.now(timezone.utc)
+                bot_info["last_trade_at"]    = datetime.now(timezone.utc)
+                bot_info["daily_trade_count"] = bot_info.get("daily_trade_count", 0) + 1
 
         bot_info["cycles_count"] += 1
         bot_info["last_cycle_at"] = datetime.now(timezone.utc)
@@ -729,7 +754,8 @@ class BotEngine:
             )
             bot_info["pending_entry"] = None
             if buy_ok:
-                bot_info["last_trade_at"] = datetime.now(timezone.utc)
+                bot_info["last_trade_at"]    = datetime.now(timezone.utc)
+                bot_info["daily_trade_count"] = bot_info.get("daily_trade_count", 0) + 1
             return bool(buy_ok)
 
         remaining = int((expires_at - now).total_seconds())
@@ -751,19 +777,21 @@ class BotEngine:
         if last is None or (now - last).total_seconds() > 900:
             try:
                 all_pairs = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: binance_service.get_top_pairs(min_volume_usdt=8_000_000)
+                    None, lambda: binance_service.get_top_pairs(min_volume_usdt=20_000_000)
                 )
-                # Hot pairs : variation > 1.5% + volume > 8M — seuils assouplis pour plus d'opportunités
+                # Hot pairs : variation > 3% + volume > 20M + symbole <= 10 chars
+                # Seuils stricts pour éviter tokens manipulés (SPCXB/DEXE/WLD type)
                 scan_set = set(SCAN_PAIRS)
                 hot = [
-                    p["symbol"] for p in all_pairs[:150]
+                    p["symbol"] for p in all_pairs[:80]
                     if p["symbol"] not in scan_set
                     and p["symbol"] not in BANNED_PAIRS
-                    and abs(p.get("change_pct", 0)) > 1.5
-                    and p.get("volume_usdt", 0) > 8_000_000
+                    and abs(p.get("change_pct", 0)) > 3.0
+                    and p.get("volume_usdt", 0) > 20_000_000
                     and p["symbol"].endswith("USDT")
                     and p["symbol"].isascii()
-                ][:10]
+                    and len(p["symbol"]) <= 10
+                ][:5]
                 cache["pairs"] = hot
                 cache["last_update"] = now
                 if hot:
@@ -849,11 +877,12 @@ class BotEngine:
             effective_action = action_5m
             effective_score  = score_5m
 
-            # RSI oversold extrême → rebond forcé (tous modes)
-            if rsi < 28:
+            # RSI oversold extrême (< 20) → rebond forcé — flash crash recovery uniquement
+            # RSI 20-28 = simplement oversold, géré par BTD logic ci-dessous
+            if rsi < 20:
                 effective_action = "BUY"
                 effective_score  = max(score_5m, 6)
-                logger.info(f"[{user_id}] {sym}: OVERSOLD EXTREME RSI={rsi:.0f} → BUY force")
+                logger.info(f"[{user_id}] {sym}: OVERSOLD EXTREME RSI={rsi:.0f} < 20 → BUY force")
 
             elif action_5m in ("SELL", "HOLD"):
                 # Buy-the-dip : 5m baissier mais TFs supérieurs haussiers
@@ -1233,7 +1262,9 @@ class BotEngine:
         prices = await self._fetch_prices(syms_needed)
 
         for trade in open_trades:
-            sym   = trade.get("symbol", "BNBUSDT")
+            sym   = trade.get("symbol", "")
+            if not sym:
+                continue
             price = prices.get(sym)
             if not price:
                 continue
@@ -1563,7 +1594,10 @@ class BotEngine:
     ) -> None:
         """Ferme une position avec le vrai solde Binance."""
         db     = get_database()
-        symbol = trade.get("symbol", "BNBUSDT")
+        symbol = trade.get("symbol", "")
+        if not symbol:
+            logger.error(f"[{user_id}] _close_position: symbole manquant dans le trade")
+            return
         entry  = float(trade.get("price", 0))
         cost   = float(trade.get("total_usdt", 0))
 
@@ -1612,7 +1646,7 @@ class BotEngine:
                 {"$set": {
                     "status": "CLOSED", "pnl": total_pnl,
                     "pnl_pct": round(pnl_pct, 4),
-                    "closed_at": datetime.utcnow(),
+                    "closed_at": datetime.now(timezone.utc),
                     "close_price": sell_price, "close_reason": reason,
                 }},
             )

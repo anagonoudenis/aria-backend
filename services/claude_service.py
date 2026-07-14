@@ -35,10 +35,11 @@ Réponds UNIQUEMENT avec ce JSON exact :
 }
 
 RÈGLES :
-- Confirme BUY seulement si ADX > 15 (tendance réelle) ET RSI < 68 ET volume > moyenne
+- Mode TRENDING (ADX > 20) : BUY si ADX > 15, RSI < 68, volume > moyenne — confidence jusqu'à 1.0.
+- Mode RANGING (ADX 8-20) : BUY possible sur rebond support/oversold, confidence MAX 0.62, SL élargi (1.0-1.5%).
+- ADX < 8 : marché trop calme, favorise HOLD sauf signal très clair.
 - Confidence MINIMUM pour un BUY valide : 0.65. En dessous, retourne HOLD.
 - Ratio TP/SL cible : 2.5:1 minimum. TP suggéré : 2.0-3.0%, SL : 0.7-1.2%.
-- Si marché en RANGING (ADX < 20), augmente le SL suggéré et réduis la confidence.
 - TRENDING_DOWN + score < 7 → HOLD obligatoire.
 - Score < 5 → toujours HOLD."""
 
