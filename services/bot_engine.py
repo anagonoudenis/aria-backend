@@ -49,11 +49,11 @@ TAKE_PROFIT_PCT    = 2.5   # TP défaut — ratio 2.8:1
 
 
 # ── Filtres BULL market (BTC > EMA21) ────────────────────────────────────────
-MIN_CONFIDENCE_BULL      = 0.68   # 68% — assoupli pour capturer plus de signaux (était 0.72)
-MIN_COMPOSITE_SCORE_BULL = 6.0    # score×conf×bonus ≥ 6.0 — qualité minimale réelle
-MIN_SCORE_RAW_BULL       = 6      # 6/15 minimum (était 7)
-MIN_ADX_BULL             = 20     # ADX ≥ 20 = tendance réelle
-MIN_VOLUME_RATIO_BULL    = 1.5    # volume 1.5x la moyenne
+MIN_CONFIDENCE_BULL      = 0.75   # 75% — seuil réel pour WR > 33% breakeven
+MIN_COMPOSITE_SCORE_BULL = 8.0    # score×conf×bonus ≥ 8.0 — qualité élevée requise
+MIN_SCORE_RAW_BULL       = 8      # 8/15 minimum — signaux forts uniquement
+MIN_ADX_BULL             = 22     # ADX ≥ 22 = tendance confirmée (était 20 trop permissif)
+MIN_VOLUME_RATIO_BULL    = 1.8    # volume 1.8x la moyenne (était 1.5)
 
 # ── Filtres BEAR market (BTC < EMA21) — rebonds oversold uniquement ──────────
 MIN_CONFIDENCE_BEAR      = 0.68   # 68% en bear (était 0.70)
@@ -78,11 +78,11 @@ MIN_COMPOSITE_SCORE = MIN_COMPOSITE_SCORE_BULL
 MIN_SCORE_RAW       = MIN_SCORE_RAW_BULL
 MIN_ADX             = MIN_ADX_BULL
 MIN_VOLUME_RATIO    = MIN_VOLUME_RATIO_BULL
-MAX_CONSECUTIVE_LOSSES   = 4        # pause après 4 pertes consécutives
+MAX_CONSECUTIVE_LOSSES   = 3        # pause après 3 pertes consécutives (était 4)
 SL_COOLDOWN_SECONDS      = 45 * 60  # 45 min cooldown par paire après SL
-MIN_TRADE_INTERVAL_SECS  = 30 * 60  # 30 min minimum entre deux trades (était 25)
+MIN_TRADE_INTERVAL_SECS  = 45 * 60  # 45 min minimum entre deux trades (était 30)
 DAILY_MAX_LOSS_PCT        = 2.0     # stoppe si perte journalière > 2%
-MAX_DAILY_TRADES          = 7       # max 7 nouveaux trades par jour (évite surtrading)
+MAX_DAILY_TRADES          = 5       # max 5 trades par jour (Jul 7: 25 trades = 8% WR)
 
 _active_cycles: set = set()
 
@@ -1071,6 +1071,12 @@ class BotEngine:
             # (n'affecte pas BEAR/NEUTRAL ni les buy-the-dip)
             if action_4h == "SELL" and market_mode == "BULL" and not is_btd_signal:
                 logger.info(f"[{user_id}] {sym}: 4h SELL en BULL — contre-tendance macro, skip")
+                continue
+
+            # En BULL : exiger au moins une confirmation TF supérieur (15m OU 1h = BUY)
+            # Sans confluence → signal 5m isolé = trop risqué
+            if market_mode == "BULL" and confluence_mult < 1.1 and not is_btd_signal:
+                logger.info(f"[{user_id}] {sym}: BULL sans confluence 15m/1h — skip")
                 continue
 
             score = round(effective_score * confluence_mult, 1)

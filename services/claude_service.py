@@ -99,7 +99,7 @@ Patterns: {', '.join(patterns) if patterns else 'Aucun'}
 CONTEXTE : P&L={safe_portfolio['total_pnl_pct']:.1f}% | WinRate={safe_portfolio['win_rate']:.0f}%
 
 EXIGENCES :
-- Confidence >= 0.65 pour trader, sinon HOLD
+- Confidence >= 0.72 pour trader, sinon HOLD (seuil élevé — ne valide que les signaux forts)
 - TP suggéré : 2.0-3.0% | SL : 0.7-1.2% | Ratio min 2.5:1
 - Si ADX < 20 (ranging) : confidence max 0.62
 Retourne UNIQUEMENT le JSON."""
