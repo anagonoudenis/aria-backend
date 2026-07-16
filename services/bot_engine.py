@@ -41,9 +41,9 @@ BANNED_PAIRS = {
 PAIR_EXTRA_FILTERS: Dict[str, Dict] = {}  # réservé pour futures paires à seuils renforcés
 
 # TP/SL — ratio 3:1
-TRAIL_TRIGGER_PCT  = 1.2   # trailing SL activé dès +1.2% profit (était 0.8 — trop tôt)
-TRAIL_STEP_PCT     = 0.35  # SL trail = highest × (1 - 0.35%) — assez serré mais respire face au bruit
-BREAKEVEN_PCT      = 1.5   # SL → entrée dès +1.5% — laisse respirer le trade (était 0.3 — trop agressif)
+TRAIL_TRIGGER_PCT  = 1.0   # trailing SL activé dès +1.0% profit (plus tôt pour protéger)
+TRAIL_STEP_PCT     = 0.25  # SL trail = highest × (1 - 0.25%) — plus serré = plus de profit verrouillé
+BREAKEVEN_PCT      = 1.0   # SL → entrée dès +1.0% (protection rapide sans partial TP)
 STOP_LOSS_PCT      = 0.9   # SL défaut légèrement plus large (évite faux triggers)
 TAKE_PROFIT_PCT    = 2.5   # TP défaut — ratio 2.8:1
 
@@ -1301,16 +1301,18 @@ class BotEngine:
             await self._partial_close_position(user_id, trade, price)
             return
 
-        # Trailing step adaptatif : plus serré quand on est bien en profit (lock gains)
+        # Trailing step adaptatif : serré à tous les niveaux pour verrouiller le profit
         adx_entry  = float(trade.get("signal_adx", 0) or 0)
         if pnl_pct >= 2.0:
-            trail_step = TRAIL_STEP_PCT  # 0.35% — lock les gains sans trigger sur le bruit
+            trail_step = 0.20   # bien en profit : trail très serré
         elif pnl_pct >= 1.5:
-            trail_step = 0.25   # > +1.5% : trail serré
+            trail_step = 0.22   # > +1.5% : lock aggressif
+        elif pnl_pct >= 1.0:
+            trail_step = 0.25   # > +1.0% : trail serré (TRAIL_STEP_PCT)
         elif adx_entry > 35:
-            trail_step = 0.30   # tendance forte à l'entrée
+            trail_step = 0.28   # tendance forte à l'entrée
         else:
-            trail_step = 0.35   # position naissante — marge contre le bruit
+            trail_step = 0.30   # position naissante — réduit de 0.35 à 0.30
 
         # Mettre à jour le plus haut
         updates = {}
@@ -1456,7 +1458,7 @@ class BotEngine:
             "signal_confidence":   signal_data["confidence"],
             "signal_source":       signal_data.get("source", "claude"),
             "signal_adx":          (indicators or {}).get("trend", {}).get("adx", 0),
-            "partial_tp_price":    round(ex_price * 1.015, 8),  # TP partiel à +1.5%
+            "partial_tp_price":    0,     # partial TP désactivé — trailing SL gère les sorties
             "partial_tp_executed": False,
         })
 
