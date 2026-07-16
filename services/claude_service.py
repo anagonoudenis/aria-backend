@@ -35,13 +35,16 @@ Réponds UNIQUEMENT avec ce JSON exact :
 }
 
 RÈGLES :
-- Mode TRENDING (ADX > 20) : BUY si ADX > 15, RSI < 68, volume > moyenne — confidence jusqu'à 1.0.
-- Mode RANGING (ADX 8-20) : BUY possible sur rebond support/oversold, confidence MAX 0.62, SL élargi (1.0-1.5%).
-- ADX < 8 : marché trop calme, favorise HOLD sauf signal très clair.
-- Confidence MINIMUM pour un BUY valide : 0.65. En dessous, retourne HOLD.
+- Mode TRENDING (ADX >= 20) : BUY si RSI < 68, volume > moyenne. Confidence jusqu'à 1.0. Minimum 0.72.
+- Mode RANGING (ADX 8-20) : BUY UNIQUEMENT sur rebond support/oversold (RSI < 45, bb_pct < 0.35). Confidence 0.60-0.65. SL élargi.
+- ADX < 8 : marché trop calme → HOLD obligatoire sauf RSI < 25 (rebond extrême).
+- Confidence MINIMUM : 0.72 en TRENDING, 0.60 en RANGING. En dessous → HOLD.
 - Ratio TP/SL cible : 2.5:1 minimum. TP suggéré : 2.0-3.0%, SL : 0.7-1.2%.
 - TRENDING_DOWN + score < 7 → HOLD obligatoire.
-- Score < 5 → toujours HOLD."""
+- Score < 5 → toujours HOLD.
+- CONFLUENCE MTF 15m=BUY ET 1h=BUY : signal fort, confidence +0.08 (jusqu'à 0.92 max).
+- CONFLUENCE MTF 15m=SELL ET 1h=SELL : contre-tendance → HOLD même si 5m BUY.
+- 4h=SELL : confidence -0.05, favorise HOLD si borderline."""
 
 
 async def analyze_market(
@@ -82,6 +85,22 @@ async def analyze_market(
     resistance = indicators.get("levels", {}).get("resistance", 0)
 
     adx_quality = "TRENDING" if adx >= 20 else "RANGING (attention)"
+
+    # Confluence multi-timeframe — crucial pour la qualité des signaux
+    mtf_line = ""
+    mtf_rule  = ""
+    if mtf_data:
+        act_15m = mtf_data.get("15m", "HOLD")
+        act_1h  = mtf_data.get("1h",  "HOLD")
+        act_4h  = mtf_data.get("4h",  "HOLD")
+        mtf_line = f"\nCONFLUENCE MTF : 15m={act_15m} | 1h={act_1h} | 4h={act_4h}"
+        if act_15m == "BUY" and act_1h == "BUY":
+            mtf_rule = "\n⚡ CONFLUENCE FORTE 15m+1h BUY → confidence jusqu'à 0.90 si autres indicateurs OK."
+        elif act_15m == "SELL" and act_1h == "SELL":
+            mtf_rule = "\n⚠️ 15m ET 1h = SELL → signal contre-tendance, favorise HOLD même si 5m BUY."
+        elif act_4h == "SELL":
+            mtf_rule = "\n⚠️ 4h = SELL → macro baissière, réduit confidence de 0.05."
+
     prompt = f"""Signal technique pour {symbol} — VALIDATION REQUISE
 
 PRIX : ${current_price:.4f}  |  Capital : ${safe_portfolio['available_usdt']:.2f} USDT
@@ -94,14 +113,13 @@ RSI={rsi:.1f} {'[SURVENDU <35]' if rsi < 35 else '[SURACHETÉ >65]' if rsi > 65 
 MACD_histo={macd_h:.6f} | EMA9={ema9:.4f} {'>' if ema9>ema21 else '<'} EMA21={ema21:.4f}
 ADX={adx:.1f} [{adx_quality}] | BB_pct={bb_pct:.2f} | Volume={vol_r:.1f}x avg | CMF={cmf:.3f}
 Support=${support:.4f} | Résistance=${resistance:.4f}
-Patterns: {', '.join(patterns) if patterns else 'Aucun'}
+Patterns: {', '.join(patterns) if patterns else 'Aucun'}{mtf_line}{mtf_rule}
 
 CONTEXTE : P&L={safe_portfolio['total_pnl_pct']:.1f}% | WinRate={safe_portfolio['win_rate']:.0f}%
 
 EXIGENCES :
-- Confidence >= 0.72 pour trader, sinon HOLD (seuil élevé — ne valide que les signaux forts)
-- TP suggéré : 2.0-3.0% | SL : 0.7-1.2% | Ratio min 2.5:1
-- Si ADX < 20 (ranging) : confidence max 0.62
+- {'Confidence >= 0.72 pour valider BUY (mode TRENDING)' if adx >= 20 else 'Confidence >= 0.60 pour valider BUY (mode RANGING — seuil adapté)'}
+- TP suggéré : {'2.0-3.0%' if adx >= 20 else '1.0-2.0%'} | SL : {'0.7-1.0%' if adx >= 20 else '0.5-0.8%'} | Ratio min 2.5:1
 Retourne UNIQUEMENT le JSON."""
 
     try:

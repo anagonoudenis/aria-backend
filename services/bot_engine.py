@@ -49,11 +49,12 @@ TAKE_PROFIT_PCT    = 2.5   # TP défaut — ratio 2.8:1
 
 
 # ── Filtres BULL market (BTC > EMA21) ────────────────────────────────────────
-MIN_CONFIDENCE_BULL      = 0.75   # 75% — seuil réel pour WR > 33% breakeven
-MIN_COMPOSITE_SCORE_BULL = 8.0    # score×conf×bonus ≥ 8.0 — qualité élevée requise
-MIN_SCORE_RAW_BULL       = 8      # 8/15 minimum — signaux forts uniquement
-MIN_ADX_BULL             = 22     # ADX ≥ 22 = tendance confirmée (était 20 trop permissif)
-MIN_VOLUME_RATIO_BULL    = 1.8    # volume 1.8x la moyenne (était 1.5)
+MIN_CONFIDENCE_BULL      = 0.75   # 75% Claude — seuil pour WR > 33% breakeven
+MIN_COMPOSITE_SCORE_BULL = 5.5    # score×conf×bonus ≥ 5.5 (était 8.0 : bloquait 90% des signaux)
+                                   # Exemple : score=8 × conf=0.75 × confluence=1.1 = 6.6 ✓
+MIN_SCORE_RAW_BULL       = 8      # 8/15 minimum — qualité suffisante
+MIN_ADX_BULL             = 22     # ADX ≥ 22 = tendance confirmée
+MIN_VOLUME_RATIO_BULL    = 1.5    # volume 1.5x (1.8 trop restrictif, non utilisé dans le scan)
 
 # ── Filtres BEAR market (BTC < EMA21) — rebonds oversold uniquement ──────────
 MIN_CONFIDENCE_BEAR      = 0.68   # 68% en bear (était 0.70)
@@ -78,11 +79,11 @@ MIN_COMPOSITE_SCORE = MIN_COMPOSITE_SCORE_BULL
 MIN_SCORE_RAW       = MIN_SCORE_RAW_BULL
 MIN_ADX             = MIN_ADX_BULL
 MIN_VOLUME_RATIO    = MIN_VOLUME_RATIO_BULL
-MAX_CONSECUTIVE_LOSSES   = 3        # pause après 3 pertes consécutives (était 4)
+MAX_CONSECUTIVE_LOSSES   = 4        # pause après 4 pertes consécutives (3 trop sensible : 21% prob à 40% WR)
 SL_COOLDOWN_SECONDS      = 45 * 60  # 45 min cooldown par paire après SL
-MIN_TRADE_INTERVAL_SECS  = 45 * 60  # 45 min minimum entre deux trades (était 30)
-DAILY_MAX_LOSS_PCT        = 2.0     # stoppe si perte journalière > 2%
-MAX_DAILY_TRADES          = 5       # max 5 trades par jour (Jul 7: 25 trades = 8% WR)
+MIN_TRADE_INTERVAL_SECS  = 20 * 60  # 20 min minimum entre deux trades (45min manquait des opportunités)
+DAILY_MAX_LOSS_PCT        = 3.5     # stoppe si perte journalière > 3.5% (2% stoppait trop tôt)
+MAX_DAILY_TRADES          = 12      # max 12 trades par jour (5 trop restrictif — 20min × 12 = 4h de fenêtre)
 
 _active_cycles: set = set()
 
@@ -232,12 +233,12 @@ class BotEngine:
 
         if bot_info.get("circuit_breaker_active"):
             since = bot_info.get("circuit_breaker_since")
-            if not since or (datetime.now(timezone.utc) - since).total_seconds() >= 4 * 3600:
+            if not since or (datetime.now(timezone.utc) - since).total_seconds() >= 2 * 3600:
                 bot_info["circuit_breaker_active"] = False
                 bot_info["circuit_breaker_reason"]  = None
                 bot_info["consecutive_losses"]      = 0
                 bot_info["cb_last_reset_at"]        = datetime.now(timezone.utc)
-                logger.info(f"[{user_id}] Circuit breaker reset automatique (4h ecoulees)")
+                logger.info(f"[{user_id}] Circuit breaker reset automatique (2h ecoulees)")
             else:
                 logger.warning(f"[{user_id}] Circuit breaker actif — cycle ignore")
                 return
@@ -692,6 +693,21 @@ class BotEngine:
         if not pending:
             return False
 
+        # Respecte les mêmes gardes que run_cycle (circuit breaker, daily limit, cooldown inter-trades)
+        if bot_info.get("circuit_breaker_active"):
+            return False
+
+        if bot_info.get("daily_trade_count", 0) >= MAX_DAILY_TRADES:
+            logger.info(f"[{user_id}] Pending entry annulé — max trades journalier atteint")
+            bot_info["pending_entry"] = None
+            return False
+
+        last_trade_at = bot_info.get("last_trade_at")
+        if last_trade_at:
+            elapsed = (datetime.now(timezone.utc) - last_trade_at).total_seconds()
+            if elapsed < MIN_TRADE_INTERVAL_SECS:
+                return False  # trop tôt, pending entry conservée pour le prochain cycle
+
         symbol     = pending["symbol"]
         target     = pending["target_entry"]
         expires_at = pending["expires_at"]
@@ -737,6 +753,13 @@ class BotEngine:
 
             max_positions = self._get_max_positions(portfolio_data.get("total_usdt", available_usdt))
             position_usdt = (available_usdt / max_positions) * 0.90
+            # Réduction taille après pertes consécutives — même logique que run_cycle
+            consecutive_now = bot_info.get("consecutive_losses", 0)
+            if consecutive_now >= 3:
+                position_usdt *= 0.5
+                logger.info(f"[{user_id}] Pending entry taille ×0.5 ({consecutive_now} pertes consécutives)")
+            elif consecutive_now >= 2:
+                position_usdt *= 0.7
             position_usdt = max(position_usdt, 5.50)
             position_usdt = min(position_usdt, available_usdt * 0.95)
 
@@ -963,8 +986,10 @@ class BotEngine:
 
                 # RSI — zone selon mode
                 if market_mode == "BEAR":
-                    if rsi > 58:
-                        logger.debug(f"{sym}: BEAR RSI={rsi:.1f} > 58 — skip")
+                    # Aligner avec run_cycle : non-BTD exige RSI <= RSI_OVERSOLD_BEAR (42)
+                    # BTD : RSI < 40 déjà vérifié dans la détection BTD ci-dessus
+                    if not is_btd_signal and rsi > RSI_OVERSOLD_BEAR:
+                        logger.debug(f"{sym}: BEAR non-BTD RSI={rsi:.1f} > {RSI_OVERSOLD_BEAR} — skip")
                         continue
                 elif market_mode == "BULL":
                     # Suracheté → toujours refuser
@@ -1097,65 +1122,92 @@ class BotEngine:
         if not scored:
             return None
 
-        # Phase 2 : meilleur candidat → validation Claude
+        # Phase 2 : essayer les 3 meilleurs candidats — si Claude rejette #1, tenter #2 et #3
+        # Corrige le problème : un refus Claude = 5 min gaspillées. Maintenant on essaie les suivants.
         scored.sort(key=lambda x: x["score"], reverse=True)
-        best_candidate = scored[0]
-        sym        = best_candidate["symbol"]
-        indicators = best_candidate["indicators"]
-        rule_sig   = best_candidate["rule_sig"]
-        price = prices.get(sym, 0)
-        if price <= 0:
+        pf = portfolio_data or {}
+
+        min_conf_seuil  = (MIN_CONFIDENCE_RANGE    if market_mode == "RANGE"
+                           else MIN_CONFIDENCE_BEAR  if market_mode == "BEAR"
+                           else MIN_CONFIDENCE_BULL)
+        min_score_seuil = (MIN_COMPOSITE_SCORE_RANGE if market_mode == "RANGE"
+                           else MIN_COMPOSITE_SCORE_BEAR if market_mode == "BEAR"
+                           else MIN_COMPOSITE_SCORE_BULL)
+
+        for best_candidate in scored[:3]:
+            sym        = best_candidate["symbol"]
+            indicators = best_candidate["indicators"]
+            rule_sig   = best_candidate["rule_sig"]
+            price = prices.get(sym, 0)
+            if price <= 0:
+                try:
+                    price = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda s=sym: binance_service.get_current_price(s)
+                    )
+                except Exception:
+                    price = 0
+            if price <= 0:
+                logger.debug(f"[{user_id}] {sym}: prix introuvable — candidat ignoré")
+                continue
+
+            tag = "[BUY-THE-DIP]" if best_candidate.get("buy_the_dip") else ("[TRIPLE BULL]" if best_candidate.get("triple_bull") else "")
+            logger.info(
+                f"[{user_id}] Candidat: {sym} score={best_candidate['score']:.1f} "
+                f"5m={best_candidate['action']} 15m={best_candidate['confluence_15m']} "
+                f"1h={best_candidate.get('confluence_1h','?')} 4h={best_candidate.get('confluence_4h','?')} {tag}"
+            )
+
+            # Données MTF passées à Claude — améliore ses décisions BUY/HOLD
+            mtf_data = {
+                "15m": best_candidate.get("confluence_15m", "HOLD"),
+                "1h":  best_candidate.get("confluence_1h",  "HOLD"),
+                "4h":  best_candidate.get("confluence_4h",  "HOLD"),
+            }
             try:
-                price = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: binance_service.get_current_price(sym)
-                )
-            except Exception:
-                price = 0
-        pf         = portfolio_data or {}
+                signal_data = await claude_service.analyze_market(sym, indicators, price, pf, mtf_data=mtf_data)
+            except Exception as e:
+                logger.warning(f"Claude failed for {sym}: {e} — using rule-based")
+                signal_data = claude_service._from_rule(rule_sig, indicators)
 
-        tag = "[BUY-THE-DIP]" if best_candidate.get("buy_the_dip") else ("[TRIPLE BULL]" if best_candidate.get("triple_bull") else "")
-        logger.info(
-            f"[{user_id}] Best: {sym} score={best_candidate['score']:.1f} "
-            f"5m={best_candidate['action']} 15m={best_candidate['confluence_15m']} "
-            f"1h={best_candidate.get('confluence_1h','?')} 4h={best_candidate.get('confluence_4h','?')} {tag}"
-        )
+            # Override Claude si buy_the_dip ET 1h confirme BUY
+            if best_candidate.get("buy_the_dip") and signal_data.get("action") != "BUY":
+                rule_score = best_candidate["rule_sig"].get("score", 0)
+                confirm_1h = best_candidate.get("confluence_1h") == "BUY"
+                if confirm_1h and rule_score >= 10:
+                    signal_data["action"]     = "BUY"
+                    signal_data["confidence"] = max(signal_data.get("confidence", 0.65), 0.66)
+                    logger.info(f"[{user_id}] Buy-the-dip override (1h BUY): {sym} → BUY {signal_data['confidence']:.0%}")
+                else:
+                    logger.info(f"[{user_id}] Buy-the-dip override annulé: 1h={best_candidate.get('confluence_1h')} score={rule_score}")
 
-        try:
-            signal_data = await claude_service.analyze_market(sym, indicators, price, pf)
-        except Exception as e:
-            logger.warning(f"Claude failed for {sym}: {e} — using rule-based")
-            signal_data = claude_service._from_rule(rule_sig, indicators)
+            bonus = 1.5 if best_candidate.get("triple_bull") else (1.2 if best_candidate.get("buy_the_dip") else 1.0)
+            composite = round(best_candidate["score"] * signal_data["confidence"] * bonus, 2)
 
-        # Override Claude uniquement si buy_the_dip ET 1h confirme BUY (signal fort)
-        if best_candidate.get("buy_the_dip") and signal_data.get("action") not in ("BUY",):
-            rule_score    = best_candidate["rule_sig"].get("score", 0)
-            confirm_1h    = best_candidate.get("confluence_1h") == "BUY"
-            # Exiger que la 1h soit BUY ET score suffisant
-            if confirm_1h and rule_score >= 10:
-                signal_data["action"]     = "BUY"
-                signal_data["confidence"] = max(signal_data.get("confidence", 0.65), 0.66)
-                logger.info(f"[{user_id}] Buy-the-dip override (1h BUY): {sym} → BUY {signal_data['confidence']:.0%}")
-            else:
-                logger.info(f"[{user_id}] Buy-the-dip override annulé: 1h={best_candidate.get('confluence_1h')} score={rule_score} mode={market_mode}")
+            logger.info(
+                f"[{user_id}] Composite: {sym} "
+                f"score={best_candidate['score']} × conf={signal_data['confidence']:.2f} "
+                f"× bonus={bonus} = {composite:.2f} (seuil={min_score_seuil} [{market_mode}])"
+            )
 
-        bonus = 1.5 if best_candidate.get("triple_bull") else (1.2 if best_candidate.get("buy_the_dip") else 1.0)
-        composite = round(best_candidate["score"] * signal_data["confidence"] * bonus, 2)
+            # Ce candidat passe les seuils → retourner immédiatement
+            if (signal_data["action"] == "BUY"
+                    and signal_data["confidence"] >= min_conf_seuil
+                    and composite >= min_score_seuil):
+                return {
+                    "symbol":          sym,
+                    "signal":          signal_data,
+                    "indicators":      indicators,
+                    "composite_score": composite,
+                    "buy_the_dip":     best_candidate.get("buy_the_dip", False),
+                }
 
-        _seuil_log = (MIN_COMPOSITE_SCORE_RANGE if market_mode == "RANGE" else
-                      (MIN_COMPOSITE_SCORE_BEAR  if market_mode == "BEAR"  else MIN_COMPOSITE_SCORE_BULL))
-        logger.info(
-            f"[{user_id}] Composite: {sym} "
-            f"score={best_candidate['score']} × conf={signal_data['confidence']:.2f} "
-            f"× bonus={bonus} = {composite:.2f} (seuil={_seuil_log} [{market_mode}])"
-        )
+            logger.info(
+                f"[{user_id}] {sym} rejeté "
+                f"(action={signal_data['action']} conf={signal_data['confidence']:.0%} "
+                f"composite={composite:.1f} < {min_score_seuil}) — essai candidat suivant"
+            )
 
-        return {
-            "symbol":          sym,
-            "signal":          signal_data,
-            "indicators":      indicators,
-            "composite_score": composite,
-            "buy_the_dip":     best_candidate.get("buy_the_dip", False),
-        }
+        return None
 
     async def _analyze_pair_fast(
         self, symbol: str
@@ -1301,18 +1353,19 @@ class BotEngine:
             await self._partial_close_position(user_id, trade, price)
             return
 
-        # Trailing step adaptatif : serré à tous les niveaux pour verrouiller le profit
+        # Trailing step adaptatif — élargi pour éviter les sorties prématurées sur micro-reculs crypto
+        # Problème corrigé : trail 0.20-0.25% se déclenchait sur volatilité normale → avg win $0.063 au lieu de $0.138
         adx_entry  = float(trade.get("signal_adx", 0) or 0)
         if pnl_pct >= 2.0:
-            trail_step = 0.20   # bien en profit : trail très serré
+            trail_step = 0.30   # près du TP : assez serré pour protéger (était 0.20, trop serré)
         elif pnl_pct >= 1.5:
-            trail_step = 0.22   # > +1.5% : lock aggressif
+            trail_step = 0.35   # bon profit : laisse respirer sans tout donner (était 0.22)
         elif pnl_pct >= 1.0:
-            trail_step = 0.25   # > +1.0% : trail serré (TRAIL_STEP_PCT)
+            trail_step = 0.45   # activation initiale : +0.45% de marge évite les faux triggers (était 0.25)
         elif adx_entry > 35:
-            trail_step = 0.28   # tendance forte à l'entrée
+            trail_step = 0.50   # tendance forte : marge généreuse (était 0.28)
         else:
-            trail_step = 0.30   # position naissante — réduit de 0.35 à 0.30
+            trail_step = 0.55   # position naissante : hors zone trailing de toute façon (était 0.30)
 
         # Mettre à jour le plus haut
         updates = {}
@@ -1743,7 +1796,7 @@ class BotEngine:
                 "macd_h":    indicators.get("trend", {}).get("macd_histogram"),
                 "adx":       indicators.get("trend", {}).get("adx"),
                 "bb_pct":    indicators.get("volatility", {}).get("bb_pct"),
-                "vol_ratio": indicators.get("volume", {}).get("volume_ratio"),
+                "vol_ratio": indicators.get("volume", {}).get("vol_ratio"),
                 "patterns":  indicators.get("patterns", {}),
                 "source":    signal_data.get("source", "claude"),
                 "timeframe_confluence": signal_data.get("timeframe_confluence", {}),

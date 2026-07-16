@@ -6,7 +6,7 @@ logger = get_logger(__name__)
 
 MAX_DRAWDOWN_PCT       = 25.0   # 25% max drawdown (capital rechargé, reset effectif)
 MAX_DAILY_LOSS_PCT     = 3.0    # 3% perte max par jour
-MIN_CONFIDENCE         = 0.65   # 65% min — signaux haute qualité uniquement
+MIN_CONFIDENCE         = 0.60   # 60% min — seuil RANGE (TRENDING validé à 0.75 dans bot_engine)
 MIN_USDT               = 5.50   # min notional Binance + marge
 MIN_ACCOUNT_USDT       = 6.0    # arrêt complet si capital < 6 USDT
 CIRCUIT_BREAKER_LOSSES = 5      # pause après 5 pertes consécutives
