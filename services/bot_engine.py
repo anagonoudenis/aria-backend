@@ -322,11 +322,32 @@ class BotEngine:
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        if available_usdt < 5.5:
-            logger.info(f"[{user_id}] Capital insuffisant ({available_usdt:.2f}) — pas de nouveau trade")
+        # Vérifier solde Futures séparément — wallet indépendant du Spot
+        _futures_balance = 0.0
+        if FUTURES_ENABLED:
+            try:
+                _futures_balance = await asyncio.get_event_loop().run_in_executor(
+                    None, futures_service.get_futures_balance
+                )
+            except Exception:
+                pass
+
+        _spot_ok    = available_usdt >= 5.5
+        _futures_ok = FUTURES_ENABLED and _futures_balance >= FUTURES_BALANCE_RESERVE + 1.0
+
+        if not _spot_ok and not _futures_ok:
+            logger.info(
+                f"[{user_id}] Capital insuffisant — Spot={available_usdt:.2f} "
+                f"Futures={_futures_balance:.2f} USDT — pas de nouveau trade"
+            )
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
+        if not _spot_ok:
+            logger.info(
+                f"[{user_id}] Spot insuffisant ({available_usdt:.2f}) — "
+                f"Futures={_futures_balance:.2f} USDT disponible — scan en cours"
+            )
 
         # ── 3. Prix courants en parallèle ────────────────────────────────────
         prices = await self._fetch_prices(all_scan)
@@ -697,15 +718,18 @@ class BotEngine:
                     bot_info["last_cycle_at"] = datetime.now(timezone.utc)
                     return  # Futures pris → pas de trade Spot en plus
 
-            # Prix deja proche ou sous EMA9 → entree Spot immédiate
-            buy_ok = await self._execute_buy(
-                user_id, db, symbol, position_usdt, current_price,
-                sl_pct, tp_pct, signal_data, portfolio_data, config,
-                indicators=indicators,
-            )
-            if buy_ok:
-                bot_info["last_trade_at"]    = datetime.now(timezone.utc)
-                bot_info["daily_trade_count"] = bot_info.get("daily_trade_count", 0) + 1
+            # Prix deja proche ou sous EMA9 → entree Spot immédiate (si capital Spot suffisant)
+            if available_usdt >= 5.5:
+                buy_ok = await self._execute_buy(
+                    user_id, db, symbol, position_usdt, current_price,
+                    sl_pct, tp_pct, signal_data, portfolio_data, config,
+                    indicators=indicators,
+                )
+                if buy_ok:
+                    bot_info["last_trade_at"]    = datetime.now(timezone.utc)
+                    bot_info["daily_trade_count"] = bot_info.get("daily_trade_count", 0) + 1
+            else:
+                logger.info(f"[{user_id}] Spot insuffisant ({available_usdt:.2f}) — trade Spot ignoré")
 
         bot_info["cycles_count"] += 1
         bot_info["last_cycle_at"] = datetime.now(timezone.utc)
@@ -1843,63 +1867,70 @@ class BotEngine:
 
     async def _manage_futures_position(self, user_id: str, trade: Dict, db) -> None:
         """
-        Gère une position Futures ouverte : check SL/TP via prix Futures (mark price).
-        Binance ferme automatiquement via les ordres serveur SL/TP.
-        On vérifie juste si la position est toujours ouverte sur Binance.
+        Gère une position Futures ouverte.
+        Binance ferme automatiquement via SL/TP serveur.
+        On détecte la clôture en vérifiant si la position existe encore sur Binance.
         """
         symbol = trade.get("symbol", "")
         try:
             position = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: futures_service.get_futures_position(symbol)
             )
+
             if position is None:
-                # Erreur API Binance — état inconnu, ne pas agir
-                logger.debug(f"[{user_id}] Futures API error pour {symbol} — skip")
+                # Erreur API Binance — état inconnu, ne pas modifier MongoDB
+                logger.debug(f"[{user_id}] Futures API error {symbol} — skip")
                 return
+
             if position:
-                # Position toujours ouverte → rien à faire (SL/TP serveur actifs)
+                # Position toujours ouverte — SL/TP serveur Binance actifs, rien à faire
                 return
-            # position == {} → fermée sur Binance (SL ou TP atteint côté serveur)
-                entry    = float(trade.get("price", 0))
-                notional = float(trade.get("notional", 0))
-                margin   = float(trade.get("total_usdt", 0))
-                tp_stored = float(trade.get("take_profit_price", 0))
-                sl_stored = float(trade.get("stop_loss_price", 0))
 
-                # Déterminer le prix de clôture réel (TP ou SL)
-                mark_price = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: futures_service.get_mark_price(symbol)
-                )
-                # Si le prix actuel est proche du TP → c'était un TP
-                # Si proche du SL → c'était un SL
-                # Sinon on utilise les prix stockés pour le calcul
-                if tp_stored > 0 and mark_price >= tp_stored * 0.98:
-                    close_price_used = tp_stored
-                    close_reason = "futures_tp"
-                elif sl_stored > 0 and mark_price <= sl_stored * 1.02:
-                    close_price_used = sl_stored
-                    close_reason = "futures_sl"
-                else:
-                    # Mouvement trop loin du TP/SL actuel → utiliser les ordres fermés
-                    close_price_used = mark_price
-                    close_reason = "futures_tp" if mark_price > entry else "futures_sl"
+            # position == {} : position fermée sur Binance (SL ou TP touché)
+            entry     = float(trade.get("price", 0))
+            notional  = float(trade.get("notional", 0))
+            margin    = float(trade.get("total_usdt", 0))
+            leverage  = int(trade.get("leverage", FUTURES_LEVERAGE))
+            tp_stored = float(trade.get("take_profit_price", 0))
+            sl_stored = float(trade.get("stop_loss_price", 0))
 
-                pnl_approx = round((close_price_used - entry) / entry * notional, 4) if entry > 0 else 0
-                await db.trades.update_one(
-                    {"_id": trade["_id"]},
-                    {"$set": {
-                        "status":      "CLOSED",
-                        "pnl":         pnl_approx,
-                        "pnl_pct":     round(pnl_approx / margin * 100, 4) if margin > 0 else 0,
-                        "close_price": mark_price,
-                        "close_reason": close_reason,
-                        "closed_at":   datetime.now(timezone.utc),
-                    }}
-                )
-                logger.info(
-                    f"[{user_id}] Futures position {symbol} fermée "
-                    f"({close_reason}) PnL≈{pnl_approx:+.4f} USDT"
-                )
+            mark_price = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: futures_service.get_mark_price(symbol)
+            )
+
+            # Déterminer si c'était un TP ou un SL selon le prix mark actuel
+            if tp_stored > 0 and mark_price >= tp_stored * 0.98:
+                close_price_used = tp_stored
+                close_reason = "futures_tp"
+            elif sl_stored > 0 and mark_price <= sl_stored * 1.02:
+                close_price_used = sl_stored
+                close_reason = "futures_sl"
+            else:
+                close_price_used = mark_price
+                close_reason = "futures_tp" if mark_price > entry else "futures_sl"
+
+            # PnL réel avec levier : (variation_prix / entrée) × notional
+            pnl_approx = round((close_price_used - entry) / entry * notional, 4) if entry > 0 else 0
+            pnl_pct    = round(pnl_approx / margin * 100, 4) if margin > 0 else 0
+
+            await db.trades.update_one(
+                {"_id": trade["_id"]},
+                {"$set": {
+                    "status":       "CLOSED",
+                    "pnl":          pnl_approx,
+                    "pnl_pct":      pnl_pct,
+                    "close_price":  close_price_used,
+                    "close_reason": close_reason,
+                    "closed_at":    datetime.now(timezone.utc),
+                }}
+            )
+            sign = "+" if pnl_approx >= 0 else ""
+            logger.info(
+                f"[{user_id}] Futures {symbol} fermée ({close_reason}) "
+                f"PnL={sign}{pnl_approx:.4f} USDT ({sign}{pnl_pct:.1f}%) "
+                f"levier={leverage}x"
+            )
+
         except Exception as e:
             logger.debug(f"[{user_id}] _manage_futures_position {symbol}: {e}")
 
