@@ -42,11 +42,11 @@ BANNED_PAIRS = {
 PAIR_EXTRA_FILTERS: Dict[str, Dict] = {}  # réservé pour futures paires à seuils renforcés
 
 # TP/SL — défauts BULL (ATR override dans run_cycle)
-TRAIL_TRIGGER_PCT  = 0.8   # trailing SL activé dès +0.8% (était 1.0 — protège plus tôt)
+TRAIL_TRIGGER_PCT  = 2.0   # trailing SL activé à +2.0% — laisse les gagnants courir
 TRAIL_STEP_PCT     = 0.25  # SL trail = highest × (1 - 0.25%)
-BREAKEVEN_PCT      = 0.8   # SL → entrée dès +0.8%
+BREAKEVEN_PCT      = 1.5   # SL → entrée dès +1.5% — protège sans couper trop tôt
 STOP_LOSS_PCT      = 0.9   # SL défaut BULL
-TAKE_PROFIT_PCT    = 2.5   # TP défaut BULL
+TAKE_PROFIT_PCT    = 3.0   # TP défaut BULL — R:R 3:1 minimum
 
 # ── SL/TP spécifiques par mode — override ATR ────────────────────────────────
 BEAR_SL_PCT  = 0.5   # BEAR : coupe vite si rebond échoue
@@ -54,31 +54,33 @@ BEAR_TP_PCT  = 1.0   # BEAR : 1% réaliste même en downtrend (WR cible 55-65%)
 RANGE_SL_PCT = 0.4   # RANGE : volatilité faible — SL très serré
 RANGE_TP_PCT = 1.2   # RANGE : milieu de bande BB
 
-# ── Filtres BULL market (BTC > EMA21) ────────────────────────────────────────
-MIN_CONFIDENCE_BULL      = 0.75
-MIN_COMPOSITE_SCORE_BULL = 5.5
-MIN_SCORE_RAW_BULL       = 8
-MIN_ADX_BULL             = 22
-MIN_VOLUME_RATIO_BULL    = 1.5
+# ── Filtres BULL market — seuils élevés, qualité avant quantité ──────────────
+MIN_CONFIDENCE_BULL      = 0.82   # relevé 0.75→0.82 : seuls les signaux forts passent
+MIN_COMPOSITE_SCORE_BULL = 6.5   # relevé 5.5→6.5
+MIN_SCORE_RAW_BULL       = 9     # relevé 8→9
+MIN_ADX_BULL             = 25    # relevé 22→25 : tendance plus établie requise
+MIN_VOLUME_RATIO_BULL    = 1.8   # relevé 1.5→1.8 : volume fort confirme le move
 
-# ── Filtres BEAR market — rebonds de capitulation uniquement ─────────────────
-MIN_CONFIDENCE_BEAR      = 0.70   # seuil relevé — bear exige plus de certitude
-MIN_COMPOSITE_SCORE_BEAR = 6.0   # signal fort requis (était 5.0)
-MIN_SCORE_RAW_BEAR       = 7     # score minimum relevé (était 6)
+# ── Filtres BEAR market — TRADING DÉSACTIVÉ ──────────────────────────────────
+# WR 27% en BEAR = pire que pile ou face. Ne jamais trader contre le trend.
+# Le capital est préservé. On attend le retour en BULL ou RANGE.
+MIN_CONFIDENCE_BEAR      = 0.70
+MIN_COMPOSITE_SCORE_BEAR = 6.0
+MIN_SCORE_RAW_BEAR       = 7
 MIN_ADX_BEAR             = 15
 MIN_VOLUME_RATIO_BEAR    = 1.2
-RSI_OVERSOLD_BEAR        = 30    # capitulation réelle (était 42 = neutre — achetait n'importe quoi)
-BB_PCT_MAX_BEAR          = 0.30  # prix dans tiers inférieur BB obligatoire en BEAR
-BEAR_MAX_DAILY_TRADES    = 4     # max 4 trades/jour en mode BEAR — qualité > quantité
+RSI_OVERSOLD_BEAR        = 28    # capitulation extrême uniquement
+BB_PCT_MAX_BEAR          = 0.15  # tiers très bas BB
+BEAR_MAX_DAILY_TRADES    = 0     # BEAR = 0 trades — capital préservé, attente BULL
 
-# ── Filtres RANGE market (ADX_BTC < 18) ──────────────────────────────────────
-MIN_CONFIDENCE_RANGE      = 0.65  # relevé (était 0.62)
-MIN_COMPOSITE_SCORE_RANGE = 5.5   # relevé (était 5.0)
-MIN_SCORE_RAW_RANGE       = 5
+# ── Filtres RANGE market — entrée uniquement en zone très basse ───────────────
+MIN_CONFIDENCE_RANGE      = 0.72  # relevé 0.65→0.72
+MIN_COMPOSITE_SCORE_RANGE = 6.0   # relevé 5.5→6.0
+MIN_SCORE_RAW_RANGE       = 6     # relevé 5→6
 MIN_ADX_RANGE             = 8
-MIN_VOLUME_RATIO_RANGE    = 0.6
-RSI_MAX_RANGE             = 48    # zone achat plus basse (était 52)
-BB_PCT_MAX_RANGE          = 0.30  # tiers inférieur strict (était 0.40)
+MIN_VOLUME_RATIO_RANGE    = 0.8   # relevé 0.6→0.8
+RSI_MAX_RANGE             = 38    # relevé 48→38 : zone oversold stricte
+BB_PCT_MAX_RANGE          = 0.18  # relevé 0.30→0.18 : fond de range uniquement
 
 # Aliases (compatibilité)
 MIN_CONFIDENCE      = MIN_CONFIDENCE_BULL
@@ -86,11 +88,12 @@ MIN_COMPOSITE_SCORE = MIN_COMPOSITE_SCORE_BULL
 MIN_SCORE_RAW       = MIN_SCORE_RAW_BULL
 MIN_ADX             = MIN_ADX_BULL
 MIN_VOLUME_RATIO    = MIN_VOLUME_RATIO_BULL
-MAX_CONSECUTIVE_LOSSES   = 3        # pause après 3 pertes consécutives (était 4)
-SL_COOLDOWN_SECONDS      = 45 * 60  # 45 min cooldown par paire après SL
-MIN_TRADE_INTERVAL_SECS  = 10 * 60  # 10 min minimum entre deux trades (était 20 min — trop lent en BULL)
-DAILY_MAX_LOSS_PCT        = 1.2     # stoppe si perte > 1.2%/jour — était 3.5% (ne se déclenchait jamais)
-MAX_DAILY_TRADES          = 18      # max 18 trades par jour (était 12 — limitait les gains en BULL)
+MAX_CONSECUTIVE_LOSSES   = 2        # circuit breaker après 2 pertes (était 3)
+SL_COOLDOWN_SECONDS      = 90 * 60  # 90 min cooldown après SL (était 45 min)
+MIN_TRADE_INTERVAL_SECS  = 20 * 60  # 20 min entre trades — qualité > quantité
+DAILY_MAX_LOSS_PCT        = 1.0     # stoppe à -1% jour (était 1.2%)
+MAX_DAILY_TRADES          = 6       # max 6 trades/jour — moins c'est plus (était 18)
+DAILY_PROFIT_LOCK_PCT     = 2.0     # verrouille les gains si +2% du capital en une journée
 
 # ── FUTURES / LEVIER ────────────────────────────────────────────────────────
 FUTURES_ENABLED          = True     # active le trading avec levier en mode Aggressive Bull
@@ -207,7 +210,11 @@ class BotEngine:
                 syms   = list({t.get("symbol") for t in open_trades})
                 prices = await self._fetch_prices(syms)
                 for trade in open_trades:
-                    sym   = trade.get("symbol", "")
+                    sym = trade.get("symbol", "")
+                    if trade.get("futures"):
+                        # Futures : détection fermeture SL/TP serveur Binance
+                        await self._manage_futures_position(user_id, trade, db)
+                        continue
                     price = prices.get(sym)
                     if price:
                         await self._manage_position(user_id, trade, price, db)
@@ -300,14 +307,29 @@ class BotEngine:
         ).to_list(200)
         daily_realized_pnl = sum(float(t.get("pnl") or 0) for t in today_closed)
 
+        # ── Protection perte journalière ─────────────────────────────────────
         if daily_realized_pnl < 0:
-            # Capital estimé en début de journée = capital actuel + pertes réalisées
             daily_start_est = total_usdt - daily_realized_pnl
             daily_loss_pct  = abs(daily_realized_pnl) / daily_start_est * 100
             if daily_loss_pct >= DAILY_MAX_LOSS_PCT:
                 logger.warning(
                     f"[{user_id}] Perte journaliere {daily_loss_pct:.1f}% "
                     f">= {DAILY_MAX_LOSS_PCT}% (PnL={daily_realized_pnl:+.4f}$) — pause trading aujourd'hui"
+                )
+                bot_info["cycles_count"] += 1
+                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+                return
+
+        # ── Verrouillage gains journaliers — protège les profits acquis ──────
+        # Si le bot a gagné >= DAILY_PROFIT_LOCK_PCT% aujourd'hui, on s'arrête.
+        # Un bon jour reste un bon jour — ne pas le retransformer en mauvais jour.
+        if daily_realized_pnl > 0 and total_usdt > 0:
+            profit_lock_threshold = total_usdt * DAILY_PROFIT_LOCK_PCT / 100
+            if daily_realized_pnl >= profit_lock_threshold:
+                logger.info(
+                    f"[{user_id}] Gains journaliers verrouilles: "
+                    f"+{daily_realized_pnl:.4f} USDT (+{daily_realized_pnl/total_usdt*100:.1f}%) "
+                    f">= {DAILY_PROFIT_LOCK_PCT}% — trading suspendu pour aujourd'hui"
                 )
                 bot_info["cycles_count"] += 1
                 bot_info["last_cycle_at"] = datetime.now(timezone.utc)
@@ -392,25 +414,31 @@ class BotEngine:
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # ── 4b. Mode marché BTC — adapte la stratégie (ne bloque plus tout) ───
+        # ── 4b. Mode marché BTC ──────────────────────────────────────────────────
         market_mode, btc_reason = await self._get_market_mode()
         bot_info["market_mode"] = market_mode
         logger.info(f"[{user_id}] Mode marche: {market_mode} — {btc_reason}")
 
-        # ── Garde BTC chute rapide — dump en cours, aucun rebond ne tient ────────
-        btc_fast_drop = await self._btc_fast_drop()
-        if btc_fast_drop:
-            logger.warning(f"[{user_id}] BTC chute rapide détectée — toutes nouvelles entrées BUY suspendues")
+        # ── BEAR = arrêt total des nouvelles positions Spot ───────────────────────
+        # WR 27% en BEAR prouve que les rebonds sont imprévisibles en downtrend.
+        # On préserve le capital et on attend BULL ou RANGE.
+        if market_mode == "BEAR":
+            logger.info(f"[{user_id}] BEAR market — aucun nouveau trade Spot (capital préservé)")
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # BEAR : max 4 trades/jour — qualité > quantité en downtrend
-        if market_mode == "BEAR" and bot_info.get("daily_trade_count", 0) >= BEAR_MAX_DAILY_TRADES:
-            logger.info(
-                f"[{user_id}] BEAR max trades ({bot_info['daily_trade_count']}/{BEAR_MAX_DAILY_TRADES}) — "
-                f"capital préservé, attente marché haussier"
-            )
+        # ── NEUTRAL = seuils très stricts, comportement conservateur ─────────────
+        if market_mode == "NEUTRAL":
+            logger.info(f"[{user_id}] NEUTRAL market — cycle skip (attente confirmation BULL ou RANGE)")
+            bot_info["cycles_count"] += 1
+            bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+            return
+
+        # ── Garde BTC chute rapide — dump en cours ───────────────────────────────
+        btc_fast_drop = await self._btc_fast_drop()
+        if btc_fast_drop:
+            logger.warning(f"[{user_id}] BTC chute rapide — entrées suspendues")
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
@@ -531,23 +559,50 @@ class BotEngine:
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # ── 8b. Filtres régime — assouplis pour buy_the_dip ──────────────────
+        # ── 8b. Filtres de confirmation techniques — BULL uniquement ─────────────
         market_regime = signal_data.get("market_regime", "RANGING")
         tf_alignment  = signal_data.get("timeframe_alignment", "MODERATE")
 
-        # TRENDING_DOWN bloqué sauf buy_the_dip ou RANGE (oscillations = normal en consolidation)
-        if market_regime == "TRENDING_DOWN" and not is_btd and market_mode != "RANGE":
-            logger.info(f"[{user_id}] TRENDING_DOWN sans BTD — trade refuse")
-            bot_info["cycles_count"] += 1
-            bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-            return
+        if market_mode == "BULL":
+            # 1. Confluence 4h obligatoire — le macro doit confirmer
+            if best.get("confluence_4h") != "BUY":
+                logger.info(f"[{user_id}] BULL: 4h={best.get('confluence_4h')} pas BUY — skip (macro pas alignée)")
+                bot_info["cycles_count"] += 1
+                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+                return
 
-        # WEAK alignment accepté pour buy_the_dip (par définition le 5m est baissier)
-        if tf_alignment == "WEAK" and not is_btd and market_mode == "BEAR":
-            logger.info(f"[{user_id}] WEAK alignment en BEAR sans BTD — trade refuse")
-            bot_info["cycles_count"] += 1
-            bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-            return
+            # 2. EMA9 > EMA21 — structure haussière sur 5m
+            ema9_v  = indicators.get("trend", {}).get("ema_9", 0)
+            ema21_v = indicators.get("trend", {}).get("ema_21", 0)
+            if ema9_v > 0 and ema21_v > 0 and ema9_v < ema21_v:
+                logger.info(f"[{user_id}] BULL: EMA9({ema9_v:.4f}) < EMA21({ema21_v:.4f}) — tendance 5m baissière, skip")
+                bot_info["cycles_count"] += 1
+                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+                return
+
+            # 3. MACD histogram positif — momentum haussier actif
+            macd_hist = indicators.get("trend", {}).get("macd_histogram", 0)
+            if macd_hist <= 0:
+                logger.info(f"[{user_id}] BULL: MACD histogram={macd_hist:.6f} ≤ 0 — momentum absent, skip")
+                bot_info["cycles_count"] += 1
+                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+                return
+
+            # 4. TRENDING_DOWN bloqué sans buy_the_dip
+            if market_regime == "TRENDING_DOWN" and not is_btd:
+                logger.info(f"[{user_id}] BULL: régime TRENDING_DOWN sans BTD — skip")
+                bot_info["cycles_count"] += 1
+                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+                return
+
+        elif market_mode == "RANGE":
+            # RANGE : stochastique oversold confirmé
+            stoch_k = indicators.get("momentum", {}).get("stoch_k", 50)
+            if stoch_k > 25:
+                logger.info(f"[{user_id}] RANGE: Stoch K={stoch_k:.1f} > 25 — pas assez oversold, skip")
+                bot_info["cycles_count"] += 1
+                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+                return
 
         # ── 9. Validation risk manager ────────────────────────────────────────
         is_valid, reason = risk_manager.validate_trade(
@@ -573,31 +628,30 @@ class BotEngine:
             logger.info(f"[{user_id}] BEAR bounce-scalp SL={sl_pct}% TP={tp_pct}% R:R=2:1")
 
         elif market_mode == "RANGE":
-            # Range scalping : SL ATR ajusté, TP ciblé vers milieu des bandes BB
+            # Range scalping : SL ATR ajusté, TP vers milieu BB, R:R minimum 3:1
             if atr > 0 and current_price > 0:
                 raw_sl = (atr / current_price) * 100
-                sl_pct = round(max(min(raw_sl, 0.5), RANGE_SL_PCT), 3)
+                sl_pct = round(max(min(raw_sl, 0.4), RANGE_SL_PCT), 3)
             else:
                 sl_pct = RANGE_SL_PCT  # 0.4%
-            # TP dynamique vers milieu BB — plus réaliste qu'un fixe 1.2%
             bb_upper_v = indicators.get("volatility", {}).get("bb_upper", 0)
             bb_lower_v = indicators.get("volatility", {}).get("bb_lower", 0)
             if bb_upper_v > 0 and bb_lower_v > 0 and current_price > 0:
                 bb_mid_v = (bb_upper_v + bb_lower_v) / 2
                 dist_mid = max((bb_mid_v - current_price) / current_price * 100, 0)
-                # 85% du chemin vers la médiane, min R:R 2:1, min 0.5%
-                tp_pct = round(max(dist_mid * 0.85, sl_pct * 2.0, 0.5), 3)
+                # 90% du chemin vers la médiane, min R:R 3:1
+                tp_pct = round(max(dist_mid * 0.90, sl_pct * 3.0), 3)
             else:
-                tp_pct = round(max(sl_pct * 3.0, RANGE_TP_PCT), 3)
+                tp_pct = round(sl_pct * 3.0, 3)
             logger.info(f"[{user_id}] RANGE scalp SL={sl_pct}% TP={tp_pct}% R:R={tp_pct/sl_pct:.1f}:1")
 
         else:
-            # BULL / NEUTRAL — trend following ATR dynamique
+            # BULL — trend following ATR dynamique, R:R minimum 3:1
             if atr > 0 and current_price > 0:
                 raw_sl = (1.0 * atr / current_price) * 100
-                raw_tp = (3.0 * atr / current_price) * 100
-                sl_pct = round(max(min(raw_sl, 1.0), 0.7), 3)    # SL [0.7%, 1.0%]
-                tp_pct = round(max(min(raw_tp, 5.0), max(2.0, sl_pct * 2.8)), 3)
+                raw_tp = (3.5 * atr / current_price) * 100
+                sl_pct = round(max(min(raw_sl, 0.9), 0.6), 3)    # SL [0.6%, 0.9%]
+                tp_pct = round(max(min(raw_tp, 5.0), max(2.2, sl_pct * 3.0)), 3)
                 logger.info(
                     f"[{user_id}] ATR SL={sl_pct}% TP={tp_pct}% ratio={tp_pct/sl_pct:.1f}:1 conf={conf:.0%} [BULL]"
                 )
@@ -606,10 +660,10 @@ class BotEngine:
                 tp_pct = TAKE_PROFIT_PCT  # 2.5%
                 logger.info(f"[{user_id}] Default SL={sl_pct}% TP={tp_pct}% [BULL]")
 
-            # R:R minimal 2.2:1 en BULL
-            if tp_pct / sl_pct < 2.2:
-                tp_pct = round(sl_pct * 2.5, 3)
-                logger.info(f"[{user_id}] R:R ajusté → SL={sl_pct}% TP={tp_pct}% (2.5:1 garanti)")
+            # R:R minimal 3:1 en BULL — garanti
+            if tp_pct / sl_pct < 3.0:
+                tp_pct = round(sl_pct * 3.0, 3)
+                logger.info(f"[{user_id}] R:R ajusté → SL={sl_pct}% TP={tp_pct}% (3:1 garanti)")
 
         # TP étendu pour setups de très haute qualité (BB Squeeze + ADX fort + triple bull)
         _bb_sq = indicators.get("volatility", {}).get("bb_squeeze", False)
@@ -1532,14 +1586,14 @@ class BotEngine:
 
         pnl_pct = (price - entry) / entry * 100
 
-        # ── PARTIAL TP : à +0.9%, ferme 50% et monte SL au breakeven ────────
-        # Capture la moitié du profit avant retournement éventuel — WR effectif +30%
+        # ── PARTIAL TP : à +2.0%, ferme 50% et monte SL au breakeven ────────
+        # Laisse le momentum s'établir avant de fermer — évite de couper les vrais gagnants
         partial_tp_price    = float(trade.get("partial_tp_price", 0))
         partial_tp_executed = bool(trade.get("partial_tp_executed", False))
         if partial_tp_price > 0 and not partial_tp_executed and price >= partial_tp_price:
             logger.info(
                 f"[{user_id}] Partial TP {trade.get('symbol','')}: "
-                f"prix={price:.4f} >= cible={partial_tp_price:.4f} (+0.9%) — fermeture 50%, SL→breakeven"
+                f"prix={price:.4f} >= cible={partial_tp_price:.4f} (+2.0%) — fermeture 50%, SL→breakeven"
             )
             await self._partial_close_position(user_id, trade, price)
             return
@@ -1564,14 +1618,14 @@ class BotEngine:
             updates["highest_price_seen"] = price
             highest = price
 
-        # ── BREAKEVEN : dès +1.5%, SL monte à l'entrée + 0.1% ───────────────
+        # ── BREAKEVEN : dès +1.5%, SL monte à l'entrée + 0.1% (BREAKEVEN_PCT=1.5) ──
         if pnl_pct >= BREAKEVEN_PCT and sl_price < entry:
             new_sl = round(entry * 1.001, 8)
             updates["stop_loss_price"] = new_sl
             sl_price = new_sl
             logger.info(f"[{user_id}] Breakeven {trade['symbol']}: SL → {new_sl:.4f} (+0.1%)")
 
-        # ── TRAILING SL : dès +0.8%, SL suit le plus haut à -trail_step% ────
+        # ── TRAILING SL : dès +2.0%, SL suit le plus haut à -trail_step% ────
         # SL monte uniquement → lock les gains progressivement
         if pnl_pct >= TRAIL_TRIGGER_PCT:
             trail_floor = round(highest * (1 - trail_step / 100), 8)
@@ -1715,7 +1769,7 @@ class BotEngine:
             "signal_confidence":   signal_data["confidence"],
             "signal_source":       signal_data.get("source", "claude"),
             "signal_adx":          (indicators or {}).get("trend", {}).get("adx", 0),
-            "partial_tp_price":    round(ex_price * 1.009, 8),  # partial TP à +0.9% — lock 50% tôt
+            "partial_tp_price":    round(ex_price * 1.020, 8),  # partial TP à +2.0% — momentum établi avant close
             "partial_tp_executed": False,
         })
 
@@ -1786,6 +1840,17 @@ class BotEngine:
         TP=5%, SL=1%, 10x levier, position 65% du capital Futures.
         """
         try:
+            # Une seule position Futures à la fois — évite le sur-levier
+            open_futures = await db.trades.find(
+                {"user_id": user_id, "status": "OPEN", "futures": True}
+            ).to_list(5)
+            if open_futures:
+                logger.info(
+                    f"[{user_id}] Futures deja ouvert sur "
+                    f"{open_futures[0].get('symbol', '?')} — pas de 2e position"
+                )
+                return False
+
             # Solde Futures disponible
             futures_balance = await asyncio.get_event_loop().run_in_executor(
                 None, futures_service.get_futures_balance
@@ -1894,24 +1959,36 @@ class BotEngine:
             tp_stored = float(trade.get("take_profit_price", 0))
             sl_stored = float(trade.get("stop_loss_price", 0))
 
-            mark_price = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: futures_service.get_mark_price(symbol)
+            # Récupérer le fill réel depuis Binance (prix exact + PnL réalisé)
+            opened_ts = trade.get("opened_at") or trade.get("created_at")
+            opened_ts_unix = opened_ts.timestamp() if opened_ts else 0.0
+
+            fill = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: futures_service.get_last_close_fill(symbol, opened_ts_unix)
             )
 
-            # Déterminer si c'était un TP ou un SL selon le prix mark actuel
-            if tp_stored > 0 and mark_price >= tp_stored * 0.98:
-                close_price_used = tp_stored
-                close_reason = "futures_tp"
-            elif sl_stored > 0 and mark_price <= sl_stored * 1.02:
-                close_price_used = sl_stored
-                close_reason = "futures_sl"
+            if fill and fill["price"] > 0:
+                close_price_used = fill["price"]
+                pnl_approx       = round(fill["realized_pnl"], 4)
+                pnl_pct          = round(pnl_approx / margin * 100, 4) if margin > 0 else 0
+                close_reason     = "futures_tp" if pnl_approx >= 0 else "futures_sl"
+                logger.debug(f"[{user_id}] Futures fill exact {symbol}: prix={close_price_used} PnL={pnl_approx}")
             else:
-                close_price_used = mark_price
-                close_reason = "futures_tp" if mark_price > entry else "futures_sl"
-
-            # PnL réel avec levier : (variation_prix / entrée) × notional
-            pnl_approx = round((close_price_used - entry) / entry * notional, 4) if entry > 0 else 0
-            pnl_pct    = round(pnl_approx / margin * 100, 4) if margin > 0 else 0
+                # Fallback : estimation via mark_price si l'API fill échoue
+                mark_price = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: futures_service.get_mark_price(symbol)
+                )
+                if tp_stored > 0 and mark_price >= tp_stored * 0.98:
+                    close_price_used = tp_stored
+                    close_reason     = "futures_tp"
+                elif sl_stored > 0 and mark_price <= sl_stored * 1.02:
+                    close_price_used = sl_stored
+                    close_reason     = "futures_sl"
+                else:
+                    close_price_used = mark_price
+                    close_reason     = "futures_tp" if mark_price > entry else "futures_sl"
+                pnl_approx = round((close_price_used - entry) / entry * notional, 4) if entry > 0 else 0
+                pnl_pct    = round(pnl_approx / margin * 100, 4) if margin > 0 else 0
 
             await db.trades.update_one(
                 {"_id": trade["_id"]},
@@ -1963,8 +2040,8 @@ class BotEngine:
 
         bot_info = self._running_bots.get(user_id, {})
         available = portfolio_data.get("available_usdt", 0)
-        if available < 15.0:
-            return  # pas assez de capital pour une 2e position
+        if available < 11.0:
+            return  # pas assez de capital pour une 2e position ($5.5 min + marge)
 
         symbol = trade.get("symbol", "")
         try:
@@ -2045,11 +2122,14 @@ class BotEngine:
                 )
                 return
             from decimal import Decimal, ROUND_DOWN
-            info     = await asyncio.get_event_loop().run_in_executor(
+            info      = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: binance_service.get_symbol_info(symbol)
             )
-            step     = Decimal(info["step_size"])
-            sell_qty = float((Decimal(str(avail * fraction)) // step) * step)
+            step      = Decimal(info["step_size"])
+            # Limiter à la quantité du trade (pas tout le solde wallet si pyramidé)
+            trade_qty  = float(trade.get("quantity", avail))
+            to_sell    = min(avail, trade_qty) * fraction
+            sell_qty   = float((Decimal(str(to_sell)) // step) * step)
             if sell_qty <= 0:
                 await db.trades.update_one(
                     {"_id": trade["_id"]}, {"$set": {"partial_tp_executed": False}}
@@ -2137,13 +2217,16 @@ class BotEngine:
                 logger.warning(f"[{user_id}] Pas de {base} disponible pour SELL")
                 return
 
-            # Précision Binance
+            # Précision Binance — vendre au max la quantité enregistrée dans le trade
+            # (évite de fermer une position pyramidée en même temps)
             from decimal import Decimal, ROUND_DOWN
             info    = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: binance_service.get_symbol_info(symbol)
             )
-            step    = Decimal(info["step_size"])
-            sell_qty= float((Decimal(str(avail)) // step) * step)
+            step     = Decimal(info["step_size"])
+            trade_qty = float(trade.get("quantity", avail))
+            to_sell   = min(avail, trade_qty)
+            sell_qty  = float((Decimal(str(to_sell)) // step) * step)
             if sell_qty <= 0:
                 return
         except Exception as e:

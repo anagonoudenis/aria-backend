@@ -227,6 +227,29 @@ class FuturesService:
             logger.error(f"Futures close_long {symbol}: {e}")
             return None
 
+    def get_last_close_fill(self, symbol: str, opened_at_ts: float) -> Optional[Dict[str, Any]]:
+        """
+        Retourne le dernier fill SELL (SL ou TP) pour une position Futures.
+        Donne le prix réel d'exécution et le PnL réalisé enregistrés par Binance.
+        - opened_at_ts : timestamp Unix (secondes) d'ouverture de la position
+        """
+        try:
+            start_ms = int(opened_at_ts * 1000)
+            fills = self._client.futures_account_trade_list(
+                symbol=symbol, limit=20, startTime=start_ms
+            )
+            for fill in sorted(fills, key=lambda x: x.get("time", 0), reverse=True):
+                if fill.get("side") == "SELL":
+                    return {
+                        "price":       float(fill.get("price", 0)),
+                        "realized_pnl": float(fill.get("realizedPnl", 0)),
+                        "qty":         float(fill.get("qty", 0)),
+                        "time":        fill.get("time", 0),
+                    }
+        except Exception as e:
+            logger.warning(f"FuturesService get_last_close_fill {symbol}: {e}")
+        return None
+
     def close_all_positions(self) -> int:
         """Ferme toutes les positions Futures ouvertes. Retourne le nombre fermé."""
         closed = 0
