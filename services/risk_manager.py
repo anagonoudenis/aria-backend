@@ -4,13 +4,13 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-MAX_DRAWDOWN_PCT       = 25.0   # 25% max drawdown (capital rechargé, reset effectif)
-MAX_DAILY_LOSS_PCT     = 3.0    # 3% perte max par jour
-MIN_CONFIDENCE         = 0.60   # 60% min — seuil RANGE (TRENDING validé à 0.75 dans bot_engine)
+MAX_DRAWDOWN_PCT       = 25.0   # 25% max drawdown
+MAX_DAILY_LOSS_PCT     = 1.2    # 1.2% perte max par jour (aligné avec bot_engine)
+MIN_CONFIDENCE         = 0.60   # 60% min absolu — les seuils par mode sont dans bot_engine
 MIN_USDT               = 5.50   # min notional Binance + marge
 MIN_ACCOUNT_USDT       = 6.0    # arrêt complet si capital < 6 USDT
-CIRCUIT_BREAKER_LOSSES = 5      # pause après 5 pertes consécutives
-MAX_ATR_RATIO          = 3.0    # volatilité max réduite
+CIRCUIT_BREAKER_LOSSES = 3      # aligné avec bot_engine MAX_CONSECUTIVE_LOSSES (était 5)
+MAX_ATR_RATIO          = 3.0    # volatilité max
 KELLY_FRACTION         = 0.20   # Kelly conservateur
 
 CORRELATED_PAIRS = [
@@ -57,7 +57,8 @@ class RiskManager:
         if available < MIN_USDT:
             return False, f"Capital insuffisant: {available:.2f} USDT < {MIN_USDT}"
 
-        max_open = bot_config.get("max_open_trades", 1)
+        # max_open_trades depuis config utilisateur, défaut 3 (cohérent avec _get_max_positions)
+        max_open = bot_config.get("max_open_trades", 3)
         if open_trades_count >= max_open:
             return False, f"Position deja ouverte ({open_trades_count}/{max_open})"
 

@@ -298,6 +298,29 @@ def generate_momentum_signal(indicators: Dict[str, Any], df: pd.DataFrame) -> Di
             if p in bull_p:
                 buy_pts.append((p, 2))
 
+        # Divergence RSI haussière — signal BEAR le plus fiable
+        # Prix fait un nouveau bas mais RSI ne suit pas → capitulation épuisée → rebond fort
+        if len(df) >= 10:
+            try:
+                rsi_series   = df["rsi"].dropna()
+                close_series = df["close"]
+                if len(rsi_series) >= 10:
+                    # Comparer la bougie actuelle vs 8 bougies en arrière
+                    close_now  = float(close_series.iloc[-1])
+                    close_back = float(close_series.iloc[-9])
+                    rsi_now    = float(rsi_series.iloc[-1])
+                    rsi_back   = float(rsi_series.iloc[-9])
+                    # Divergence haussière : prix plus bas ET RSI plus haut
+                    if close_now < close_back * 0.998 and rsi_now > rsi_back + 2.0 and rsi_now < 40:
+                        buy_pts.append(("Divergence RSI haussiere", 3))
+            except Exception:
+                pass
+
+        # RSI cross haussier — meilleur signal de rebond : capitulation CONFIRMÉE
+        # Acheter la remontée confirmée, pas la chute (was < 30 → now > 32)
+        if rsi_prev < 30 and rsi > 32:
+            buy_pts.append(("RSI cross haussier — capitulation terminee", 5))
+
         buy_score = sum(v for _, v in buy_pts)
 
         # ── Score SELL ────────────────────────────────────────────────────────

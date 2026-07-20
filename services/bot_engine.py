@@ -7,6 +7,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from database import get_database
 from services import analysis_service, claude_service
 from services.binance_service import binance_service
+from services.futures_service import futures_service
 from services.risk_manager import risk_manager
 from services.notification_service import notification_service
 from models.signal import SignalInDB
@@ -40,38 +41,44 @@ BANNED_PAIRS = {
 }
 PAIR_EXTRA_FILTERS: Dict[str, Dict] = {}  # réservé pour futures paires à seuils renforcés
 
-# TP/SL — ratio 3:1
-TRAIL_TRIGGER_PCT  = 1.0   # trailing SL activé dès +1.0% profit (plus tôt pour protéger)
-TRAIL_STEP_PCT     = 0.25  # SL trail = highest × (1 - 0.25%) — plus serré = plus de profit verrouillé
-BREAKEVEN_PCT      = 1.0   # SL → entrée dès +1.0% (protection rapide sans partial TP)
-STOP_LOSS_PCT      = 0.9   # SL défaut légèrement plus large (évite faux triggers)
-TAKE_PROFIT_PCT    = 2.5   # TP défaut — ratio 2.8:1
+# TP/SL — défauts BULL (ATR override dans run_cycle)
+TRAIL_TRIGGER_PCT  = 0.8   # trailing SL activé dès +0.8% (était 1.0 — protège plus tôt)
+TRAIL_STEP_PCT     = 0.25  # SL trail = highest × (1 - 0.25%)
+BREAKEVEN_PCT      = 0.8   # SL → entrée dès +0.8%
+STOP_LOSS_PCT      = 0.9   # SL défaut BULL
+TAKE_PROFIT_PCT    = 2.5   # TP défaut BULL
 
+# ── SL/TP spécifiques par mode — override ATR ────────────────────────────────
+BEAR_SL_PCT  = 0.5   # BEAR : coupe vite si rebond échoue
+BEAR_TP_PCT  = 1.0   # BEAR : 1% réaliste même en downtrend (WR cible 55-65%)
+RANGE_SL_PCT = 0.4   # RANGE : volatilité faible — SL très serré
+RANGE_TP_PCT = 1.2   # RANGE : milieu de bande BB
 
 # ── Filtres BULL market (BTC > EMA21) ────────────────────────────────────────
-MIN_CONFIDENCE_BULL      = 0.75   # 75% Claude — seuil pour WR > 33% breakeven
-MIN_COMPOSITE_SCORE_BULL = 5.5    # score×conf×bonus ≥ 5.5 (était 8.0 : bloquait 90% des signaux)
-                                   # Exemple : score=8 × conf=0.75 × confluence=1.1 = 6.6 ✓
-MIN_SCORE_RAW_BULL       = 8      # 8/15 minimum — qualité suffisante
-MIN_ADX_BULL             = 22     # ADX ≥ 22 = tendance confirmée
-MIN_VOLUME_RATIO_BULL    = 1.5    # volume 1.5x (1.8 trop restrictif, non utilisé dans le scan)
+MIN_CONFIDENCE_BULL      = 0.75
+MIN_COMPOSITE_SCORE_BULL = 5.5
+MIN_SCORE_RAW_BULL       = 8
+MIN_ADX_BULL             = 22
+MIN_VOLUME_RATIO_BULL    = 1.5
 
-# ── Filtres BEAR market (BTC < EMA21) — rebonds oversold uniquement ──────────
-MIN_CONFIDENCE_BEAR      = 0.68   # 68% en bear (était 0.70)
-MIN_COMPOSITE_SCORE_BEAR = 5.0    # seuil bear (était 6.5 — trop restrictif)
-MIN_SCORE_RAW_BEAR       = 6      # 6/15 minimum (était 7)
-MIN_ADX_BEAR             = 15     # ADX ≥ 15 en bear
-MIN_VOLUME_RATIO_BEAR    = 1.2    # volume 1.2x
-RSI_OVERSOLD_BEAR        = 42     # RSI < 42 — vrai oversold (était 45)
+# ── Filtres BEAR market — rebonds de capitulation uniquement ─────────────────
+MIN_CONFIDENCE_BEAR      = 0.70   # seuil relevé — bear exige plus de certitude
+MIN_COMPOSITE_SCORE_BEAR = 6.0   # signal fort requis (était 5.0)
+MIN_SCORE_RAW_BEAR       = 7     # score minimum relevé (était 6)
+MIN_ADX_BEAR             = 15
+MIN_VOLUME_RATIO_BEAR    = 1.2
+RSI_OVERSOLD_BEAR        = 30    # capitulation réelle (était 42 = neutre — achetait n'importe quoi)
+BB_PCT_MAX_BEAR          = 0.30  # prix dans tiers inférieur BB obligatoire en BEAR
+BEAR_MAX_DAILY_TRADES    = 4     # max 4 trades/jour en mode BEAR — qualité > quantité
 
-# ── Filtres RANGE market (ADX_BTC < 18) — stratégie rebonds sur support/BB ──
-MIN_CONFIDENCE_RANGE      = 0.62   # 62% — adapté aux signaux range moins intenses
-MIN_COMPOSITE_SCORE_RANGE = 5.0    # composite relevé — range génère trop de faux signaux à 3.5
-MIN_SCORE_RAW_RANGE       = 5      # 5/15 minimum (moins strict qu'en BULL)
-MIN_ADX_RANGE             = 8      # ADX bas autorisé — range = pas de tendance macro
-MIN_VOLUME_RATIO_RANGE    = 0.6    # volume faible = normal en consolidation
-RSI_MAX_RANGE             = 52     # RSI < 52 pour acheter (zone inférieure range)
-BB_PCT_MAX_RANGE          = 0.40   # bb_pct < 0.40 = prix dans tiers inférieur BB
+# ── Filtres RANGE market (ADX_BTC < 18) ──────────────────────────────────────
+MIN_CONFIDENCE_RANGE      = 0.65  # relevé (était 0.62)
+MIN_COMPOSITE_SCORE_RANGE = 5.5   # relevé (était 5.0)
+MIN_SCORE_RAW_RANGE       = 5
+MIN_ADX_RANGE             = 8
+MIN_VOLUME_RATIO_RANGE    = 0.6
+RSI_MAX_RANGE             = 48    # zone achat plus basse (était 52)
+BB_PCT_MAX_RANGE          = 0.30  # tiers inférieur strict (était 0.40)
 
 # Aliases (compatibilité)
 MIN_CONFIDENCE      = MIN_CONFIDENCE_BULL
@@ -79,11 +86,24 @@ MIN_COMPOSITE_SCORE = MIN_COMPOSITE_SCORE_BULL
 MIN_SCORE_RAW       = MIN_SCORE_RAW_BULL
 MIN_ADX             = MIN_ADX_BULL
 MIN_VOLUME_RATIO    = MIN_VOLUME_RATIO_BULL
-MAX_CONSECUTIVE_LOSSES   = 4        # pause après 4 pertes consécutives (3 trop sensible : 21% prob à 40% WR)
+MAX_CONSECUTIVE_LOSSES   = 3        # pause après 3 pertes consécutives (était 4)
 SL_COOLDOWN_SECONDS      = 45 * 60  # 45 min cooldown par paire après SL
-MIN_TRADE_INTERVAL_SECS  = 20 * 60  # 20 min minimum entre deux trades (45min manquait des opportunités)
-DAILY_MAX_LOSS_PCT        = 3.5     # stoppe si perte journalière > 3.5% (2% stoppait trop tôt)
-MAX_DAILY_TRADES          = 12      # max 12 trades par jour (5 trop restrictif — 20min × 12 = 4h de fenêtre)
+MIN_TRADE_INTERVAL_SECS  = 10 * 60  # 10 min minimum entre deux trades (était 20 min — trop lent en BULL)
+DAILY_MAX_LOSS_PCT        = 1.2     # stoppe si perte > 1.2%/jour — était 3.5% (ne se déclenchait jamais)
+MAX_DAILY_TRADES          = 18      # max 18 trades par jour (était 12 — limitait les gains en BULL)
+
+# ── FUTURES / LEVIER ────────────────────────────────────────────────────────
+FUTURES_ENABLED          = True     # active le trading avec levier en mode Aggressive Bull
+FUTURES_LEVERAGE         = 10       # 10x levier — 20 USDT → 200 USDT pouvoir d'achat
+FUTURES_BALANCE_RESERVE  = 2.0     # garder 2 USDT non engagés comme marge de sécurité
+MAX_DAILY_LOSS_FUTURES   = 8.0     # arrêt total Futures si perte > 8 USDT/jour
+
+# ── AGGRESSIVE BULL MODE ────────────────────────────────────────────────────
+AGGRESSIVE_BULL_MIN_CONF    = 0.85  # confiance minimale pour mode agressif
+AGGRESSIVE_BULL_MIN_ADX     = 30    # ADX minimum — tendance forte requise
+AGGRESSIVE_BULL_POSITION_PCT = 0.65 # 65% du capital Futures engagé
+AGGRESSIVE_BULL_TP_PCT       = 5.0  # TP 5% — ride le trend
+AGGRESSIVE_BULL_SL_PCT       = 1.0  # SL 1% — coupe vite si ça retourne
 
 _active_cycles: set = set()
 
@@ -243,9 +263,10 @@ class BotEngine:
                 logger.warning(f"[{user_id}] Circuit breaker actif — cycle ignore")
                 return
 
-        # ── 0. Filtre horaire — zone morte mondiale 02h-06h UTC (volume ultra-faible = faux signaux) ──
+        # ── 0. Filtre horaire — zone morte 03h-05h UTC (réduit de 4h à 2h)
+        # 02h-03h conservé car oversold BEAR fréquents en début session asiatique
         utc_hour = datetime.now(timezone.utc).hour
-        if 2 <= utc_hour <= 6:
+        if 3 <= utc_hour <= 5:
             logger.info(f"[{user_id}] Zone morte ({utc_hour}h UTC) — cycle skip")
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
@@ -355,6 +376,24 @@ class BotEngine:
         bot_info["market_mode"] = market_mode
         logger.info(f"[{user_id}] Mode marche: {market_mode} — {btc_reason}")
 
+        # ── Garde BTC chute rapide — dump en cours, aucun rebond ne tient ────────
+        btc_fast_drop = await self._btc_fast_drop()
+        if btc_fast_drop:
+            logger.warning(f"[{user_id}] BTC chute rapide détectée — toutes nouvelles entrées BUY suspendues")
+            bot_info["cycles_count"] += 1
+            bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+            return
+
+        # BEAR : max 4 trades/jour — qualité > quantité en downtrend
+        if market_mode == "BEAR" and bot_info.get("daily_trade_count", 0) >= BEAR_MAX_DAILY_TRADES:
+            logger.info(
+                f"[{user_id}] BEAR max trades ({bot_info['daily_trade_count']}/{BEAR_MAX_DAILY_TRADES}) — "
+                f"capital préservé, attente marché haussier"
+            )
+            bot_info["cycles_count"] += 1
+            bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+            return
+
         # ── 5. Positions ouvertes + limite adaptative ─────────────────────────
         open_trades = await db.trades.find(
             {"user_id": user_id, "status": "OPEN"}
@@ -425,14 +464,19 @@ class BotEngine:
         elif market_mode == "BEAR":
             min_conf  = MIN_CONFIDENCE_BEAR
             min_score = MIN_COMPOSITE_SCORE_BEAR
-            # RSI check seulement pour les signaux BUY classiques (pas buy_the_dip)
-            if not is_btd:
-                rsi_chk = indicators.get("momentum", {}).get("rsi", 50)
-                if rsi_chk > RSI_OVERSOLD_BEAR:
-                    logger.info(f"[{user_id}] BEAR RSI {rsi_chk:.1f} > {RSI_OVERSOLD_BEAR} — refuse (oversold requis)")
-                    bot_info["cycles_count"] += 1
-                    bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-                    return
+            # RSI capitulation obligatoire (≤ 30) pour tous les signaux BEAR
+            rsi_chk    = indicators.get("momentum", {}).get("rsi", 50)
+            bb_pct_chk = indicators.get("volatility", {}).get("bb_pct", 0.5)
+            if rsi_chk > RSI_OVERSOLD_BEAR:
+                logger.info(f"[{user_id}] BEAR RSI {rsi_chk:.1f} > {RSI_OVERSOLD_BEAR} — pas en capitulation, refuse")
+                bot_info["cycles_count"] += 1
+                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+                return
+            if bb_pct_chk > BB_PCT_MAX_BEAR:
+                logger.info(f"[{user_id}] BEAR bb_pct={bb_pct_chk:.2f} > {BB_PCT_MAX_BEAR} — hors zone rebond, refuse")
+                bot_info["cycles_count"] += 1
+                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+                return
         elif market_mode == "RANGE":
             min_conf  = MIN_CONFIDENCE_RANGE
             min_score = MIN_COMPOSITE_SCORE_RANGE
@@ -496,36 +540,55 @@ class BotEngine:
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # ── 10. SL/TP — ATR dynamique, adapté au market_mode ────────────────
+        # ── 10. SL/TP — stratégie adaptée au mode marché ────────────────────
         conf = signal_data["confidence"]
-        atr = indicators.get("volatility", {}).get("atr", 0)
-        if atr > 0 and current_price > 0:
-            raw_sl = (1.0 * atr / current_price) * 100
-            raw_tp = (3.0 * atr / current_price) * 100
-            if market_mode == "RANGE":
-                # RANGE : ATR naturellement petit — cibles resserrées, R:R 2.5:1 maintenu
-                sl_pct = round(max(min(raw_sl, 0.7), 0.35), 3)   # SL [0.35%, 0.7%]
-                tp_pct = round(max(min(raw_tp, 2.5), max(0.9, sl_pct * 2.5)), 3)  # TP [0.9%, 2.5%]
+        atr  = indicators.get("volatility", {}).get("atr", 0)
+
+        if market_mode == "BEAR":
+            # Bounce scalping : TP réaliste 1%, SL serré 0.5% — R:R 2:1
+            # En downtrend les rebonds durent peu — prendre profit vite
+            sl_pct = BEAR_SL_PCT   # 0.5%
+            tp_pct = BEAR_TP_PCT   # 1.0%
+            logger.info(f"[{user_id}] BEAR bounce-scalp SL={sl_pct}% TP={tp_pct}% R:R=2:1")
+
+        elif market_mode == "RANGE":
+            # Range scalping : SL ATR ajusté, TP ciblé vers milieu des bandes BB
+            if atr > 0 and current_price > 0:
+                raw_sl = (atr / current_price) * 100
+                sl_pct = round(max(min(raw_sl, 0.5), RANGE_SL_PCT), 3)
             else:
-                # Tendance (BULL/BEAR/NEUTRAL) : SL [0.7%-1.0%], TP [2.0%-5.0%]
-                sl_pct = round(max(min(raw_sl, 1.0), 0.7), 3)
-                tp_pct = round(max(min(raw_tp, 5.0), max(2.0, sl_pct * 2.8)), 3)
-            logger.info(
-                f"[{user_id}] ATR SL={sl_pct}% TP={tp_pct}% ratio={tp_pct/sl_pct:.1f}:1 conf={conf:.0%} [{market_mode}]"
-            )
+                sl_pct = RANGE_SL_PCT  # 0.4%
+            # TP dynamique vers milieu BB — plus réaliste qu'un fixe 1.2%
+            bb_upper_v = indicators.get("volatility", {}).get("bb_upper", 0)
+            bb_lower_v = indicators.get("volatility", {}).get("bb_lower", 0)
+            if bb_upper_v > 0 and bb_lower_v > 0 and current_price > 0:
+                bb_mid_v = (bb_upper_v + bb_lower_v) / 2
+                dist_mid = max((bb_mid_v - current_price) / current_price * 100, 0)
+                # 85% du chemin vers la médiane, min R:R 2:1, min 0.5%
+                tp_pct = round(max(dist_mid * 0.85, sl_pct * 2.0, 0.5), 3)
+            else:
+                tp_pct = round(max(sl_pct * 3.0, RANGE_TP_PCT), 3)
+            logger.info(f"[{user_id}] RANGE scalp SL={sl_pct}% TP={tp_pct}% R:R={tp_pct/sl_pct:.1f}:1")
+
         else:
-            if market_mode == "RANGE":
-                sl_pct = 0.5   # SL serré en range (ATR indisponible)
-                tp_pct = 1.3   # TP modéré en range — R:R 2.6:1
+            # BULL / NEUTRAL — trend following ATR dynamique
+            if atr > 0 and current_price > 0:
+                raw_sl = (1.0 * atr / current_price) * 100
+                raw_tp = (3.0 * atr / current_price) * 100
+                sl_pct = round(max(min(raw_sl, 1.0), 0.7), 3)    # SL [0.7%, 1.0%]
+                tp_pct = round(max(min(raw_tp, 5.0), max(2.0, sl_pct * 2.8)), 3)
+                logger.info(
+                    f"[{user_id}] ATR SL={sl_pct}% TP={tp_pct}% ratio={tp_pct/sl_pct:.1f}:1 conf={conf:.0%} [BULL]"
+                )
             else:
                 sl_pct = STOP_LOSS_PCT    # 0.9%
                 tp_pct = TAKE_PROFIT_PCT  # 2.5%
-            logger.info(f"[{user_id}] Default SL={sl_pct}% TP={tp_pct}% [{market_mode}]")
+                logger.info(f"[{user_id}] Default SL={sl_pct}% TP={tp_pct}% [BULL]")
 
-        # Vérification R:R minimal (sécurité absolue)
-        if tp_pct / sl_pct < 2.2:
-            tp_pct = round(sl_pct * 2.5, 3)
-            logger.info(f"[{user_id}] R:R ajusté → SL={sl_pct}% TP={tp_pct}% (2.5:1 garanti)")
+            # R:R minimal 2.2:1 en BULL
+            if tp_pct / sl_pct < 2.2:
+                tp_pct = round(sl_pct * 2.5, 3)
+                logger.info(f"[{user_id}] R:R ajusté → SL={sl_pct}% TP={tp_pct}% (2.5:1 garanti)")
 
         # TP étendu pour setups de très haute qualité (BB Squeeze + ADX fort + triple bull)
         _bb_sq = indicators.get("volatility", {}).get("bb_squeeze", False)
@@ -564,6 +627,12 @@ class BotEngine:
         position_usdt = max(position_usdt, 5.50)
         position_usdt = min(position_usdt, available_usdt * 0.90)
 
+        # BEAR : position réduite — on scalpe des rebonds, on ne mise pas gros
+        if market_mode == "BEAR":
+            position_usdt *= 0.65
+            position_usdt = max(position_usdt, 5.50)
+            logger.info(f"[{user_id}] BEAR mode — position ×0.65 (rebond scalping)")
+
         # Multiplicateur qualité setup : BB Squeeze ou ADX fort → position plus grande
         bb_squeeze_now  = indicators.get("volatility", {}).get("bb_squeeze", False)
         bb_expanding_now = indicators.get("volatility", {}).get("bb_expanding", False)
@@ -572,15 +641,17 @@ class BotEngine:
         conf_now        = signal_data.get("confidence", 0)
 
         quality_label = ""
-        if bb_squeeze_now and bb_expanding_now:
-            position_usdt = min(position_usdt * 1.25, available_usdt * 0.92)
-            quality_label = " [BB-SQUEEZE ×1.25]"
-        elif adx_now_val > 30 and adx_rising_now:
-            position_usdt = min(position_usdt * 1.15, available_usdt * 0.92)
-            quality_label = " [ADX-FORT ×1.15]"
-        elif conf_now >= 0.82:
-            position_usdt = min(position_usdt * 1.10, available_usdt * 0.92)
-            quality_label = " [CONF-HAUTE ×1.10]"
+        # Multiplicateurs qualité désactivés en BEAR — position déjà réduite à ×0.65
+        if market_mode != "BEAR":
+            if bb_squeeze_now and bb_expanding_now:
+                position_usdt = min(position_usdt * 1.25, available_usdt * 0.92)
+                quality_label = " [BB-SQUEEZE ×1.25]"
+            elif adx_now_val > 30 and adx_rising_now:
+                position_usdt = min(position_usdt * 1.15, available_usdt * 0.92)
+                quality_label = " [ADX-FORT ×1.15]"
+            elif conf_now >= 0.82:
+                position_usdt = min(position_usdt * 1.10, available_usdt * 0.92)
+                quality_label = " [CONF-HAUTE ×1.10]"
 
         logger.info(
             f"[{user_id}] Position: {position_usdt:.2f} USDT "
@@ -588,9 +659,9 @@ class BotEngine:
         )
 
         # ── 12. Pullback entry — attendre EMA9 si prix trop haut ─────────────
-        # Non applicable en RANGE : on achète au bas de BB, pas besoin d'attendre EMA9
+        # Non applicable en RANGE ni BEAR : en BEAR RSI≤30 = déjà sous EMA9 par définition
         ema9 = indicators.get("trend", {}).get("ema_9", 0)
-        if ema9 > 0 and current_price > ema9 * 1.003 and market_mode != "RANGE":
+        if ema9 > 0 and current_price > ema9 * 1.003 and market_mode not in ("RANGE", "BEAR"):
             # Prix > EMA9 + 0.3% → attendre un pullback vers EMA9
             bot_info["pending_entry"] = {
                 "symbol":        symbol,
@@ -608,7 +679,25 @@ class BotEngine:
                 f"prix={current_price:.4f} > EMA9={ema9:.4f} — attente retour"
             )
         else:
-            # Prix deja proche ou sous EMA9 → entree immediate
+            # ── BLOC A : Aggressive Bull Mode — trade Futures avec levier ──────
+            adx_for_agg  = indicators.get("trend", {}).get("adx", 0)
+            triple_for_agg = best.get("triple_bull", False) if best else False
+            use_futures = self._is_aggressive_bull(
+                market_mode, signal_data.get("confidence", 0), adx_for_agg, triple_for_agg
+            )
+            if use_futures:
+                futures_ok = await self._execute_futures_long(
+                    user_id, db, symbol, signal_data, current_price, indicators
+                )
+                if futures_ok:
+                    bot_info["last_trade_at"]     = datetime.now(timezone.utc)
+                    bot_info["daily_trade_count"] = bot_info.get("daily_trade_count", 0) + 1
+                    logger.info(f"[{user_id}] 🚀 Futures LONG exécuté — skip trade Spot")
+                    bot_info["cycles_count"] += 1
+                    bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+                    return  # Futures pris → pas de trade Spot en plus
+
+            # Prix deja proche ou sous EMA9 → entree Spot immédiate
             buy_ok = await self._execute_buy(
                 user_id, db, symbol, position_usdt, current_price,
                 sl_pct, tp_pct, signal_data, portfolio_data, config,
@@ -627,51 +716,104 @@ class BotEngine:
 
     async def _get_market_mode(self) -> Tuple[str, str]:
         """
-        Détermine le mode de marché actuel : BULL / BEAR / NEUTRAL.
-        Ne bloque JAMAIS les trades — adapte seulement les filtres.
-        BULL   → seuils assouplis, toutes paires
-        NEUTRAL→ seuils standard
-        BEAR   → seuils plus stricts, cherche uniquement les oversold extrêmes
+        Détermine le mode de marché : BULL / BEAR / RANGE / NEUTRAL.
+        Utilise 15m + 1h pour éviter les faux changements de mode sur micro-mouvements.
         """
         try:
-            key_df = "klines:BTCUSDT:15m"
-            df = cache.get(key_df)
-            if df is None:
-                df = await asyncio.get_event_loop().run_in_executor(
+            # ── 15m : tendance court terme ────────────────────────────────────
+            key_df15 = "klines:BTCUSDT:15m"
+            df15 = cache.get(key_df15)
+            if df15 is None:
+                df15 = await asyncio.get_event_loop().run_in_executor(
                     None, lambda: binance_service.get_klines("BTCUSDT", "15m", limit=100)
                 )
-                cache.set(key_df, df, ttl_seconds=KLINE_TTL.get("15m", 900))
+                cache.set(key_df15, df15, ttl_seconds=KLINE_TTL.get("15m", 900))
 
-            key_ind = "indicators:BTCUSDT:15m"
-            ind = cache.get(key_ind)
-            if ind is None:
-                ind = analysis_service.compute_indicators(df, symbol="BTCUSDT")
-                cache.set(key_ind, ind, ttl_seconds=INDICATOR_TTL.get("15m", 900))
+            key_i15 = "indicators:BTCUSDT:15m"
+            ind15 = cache.get(key_i15)
+            if ind15 is None:
+                ind15 = analysis_service.compute_indicators(df15, symbol="BTCUSDT")
+                cache.set(key_i15, ind15, ttl_seconds=INDICATOR_TTL.get("15m", 900))
 
-            trend     = ind.get("trend", {})
-            candles   = ind.get("candles_summary", [])
-            btc_close = candles[-1]["close"] if candles else 0
-            ema21     = trend.get("ema_21", 0)
-            sma50     = trend.get("sma_50", 0)
-            adx_btc   = trend.get("adx", 0)
+            # ── 1h : tendance moyen terme ─────────────────────────────────────
+            key_df1h = "klines:BTCUSDT:1h"
+            df1h = cache.get(key_df1h)
+            if df1h is None:
+                df1h = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: binance_service.get_klines("BTCUSDT", "1h", limit=50)
+                )
+                cache.set(key_df1h, df1h, ttl_seconds=KLINE_TTL.get("1h", 3600))
 
-            if btc_close <= 0 or ema21 <= 0:
+            key_i1h = "indicators:BTCUSDT:1h"
+            ind1h = cache.get(key_i1h)
+            if ind1h is None:
+                ind1h = analysis_service.compute_indicators(df1h, symbol="BTCUSDT")
+                cache.set(key_i1h, ind1h, ttl_seconds=INDICATOR_TTL.get("1h", 3600))
+
+            trend15   = ind15.get("trend", {})
+            candles15 = ind15.get("candles_summary", [])
+            btc_close = candles15[-1]["close"] if candles15 else 0
+            ema21_15  = trend15.get("ema_21", 0)
+            adx_15    = trend15.get("adx", 0)
+
+            trend1h   = ind1h.get("trend", {})
+            ema21_1h  = trend1h.get("ema_21", 0)
+            adx_1h    = trend1h.get("adx", 0)
+
+            if btc_close <= 0 or ema21_15 <= 0:
                 return "NEUTRAL", "donnees BTC indisponibles"
 
-            # RANGE : ADX BTC < 18 = pas de tendance macro — stratégie rebonds sur support/BB
-            if adx_btc > 0 and adx_btc < 18:
-                return "RANGE", f"BTC ADX={adx_btc:.1f} < 18 — consolidation, stratégie range activée"
+            # RANGE : ADX faible sur les 2 TF = vraie consolidation
+            if adx_15 > 0 and adx_15 < 18 and adx_1h < 22:
+                return "RANGE", f"BTC ADX15={adx_15:.1f} ADX1h={adx_1h:.1f} — consolidation confirmée"
 
-            if btc_close > ema21 and (sma50 == 0 or ema21 > sma50):
-                return "BULL", f"BTC {btc_close:.0f} > EMA21 {ema21:.0f}"
-            elif btc_close > ema21:
-                return "NEUTRAL", f"BTC haussier CT mais structure mixte"
-            else:
-                return "BEAR", f"BTC {btc_close:.0f} < EMA21 {ema21:.0f} — rebonds oversold uniquement"
+            # BULL : 15m ET 1h au-dessus EMA21 = tendance haussière solide
+            bull_15m = btc_close > ema21_15
+            # ema21_1h doit être > 0 : si données absentes → NEUTRAL (pas de faux BULL)
+            bull_1h  = (ema21_1h > 0 and btc_close > ema21_1h)
+            if bull_15m and bull_1h:
+                return "BULL", f"BTC {btc_close:.0f} > EMA21_15m={ema21_15:.0f} + 1h haussier"
+
+            # BEAR : 15m ET 1h sous EMA21 = downtrend confirmé
+            bear_15m = btc_close < ema21_15
+            bear_1h  = (ema21_1h > 0 and btc_close < ema21_1h)
+            if bear_15m and bear_1h:
+                return "BEAR", f"BTC {btc_close:.0f} < EMA21_15m={ema21_15:.0f} + 1h baissier"
+
+            # Signaux contradictoires ou données 1h absentes → NEUTRAL
+            return "NEUTRAL", f"BTC 15m={'haussier' if bull_15m else 'baissier'} — confirmation 1h insuffisante"
 
         except Exception as e:
             logger.warning(f"Market mode check failed: {e}")
             return "NEUTRAL", "erreur — mode NEUTRAL par defaut"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # GARDE BTC CHUTE RAPIDE
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _btc_fast_drop(self) -> bool:
+        """Détecte une chute BTC > 1.5% sur les 3 dernières bougies 5m.
+        Si vrai : dump actif, aucun rebond ne tient — suspendre tous les BUY."""
+        try:
+            key = "klines:BTCUSDT:5m"
+            df = cache.get(key)
+            if df is None:
+                df = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: binance_service.get_klines("BTCUSDT", "5m", limit=20)
+                )
+                cache.set(key, df, ttl_seconds=60)
+            if df is None or len(df) < 4:
+                return False
+            recent = df.tail(4)
+            price_now  = float(recent.iloc[-1]["close"])
+            price_3ago = float(recent.iloc[0]["close"])
+            drop_pct = (price_now - price_3ago) / price_3ago * 100
+            if drop_pct < -1.5:
+                logger.warning(f"BTC fast drop: {drop_pct:.2f}% en 15min — entrées suspendues")
+                return True
+            return False
+        except Exception:
+            return False
 
     # ══════════════════════════════════════════════════════════════════════════
     # PULLBACK ENTRY — ENTRÉE SUR RETOUR EMA9
@@ -914,7 +1056,7 @@ class BotEngine:
                 if market_mode == "BULL":
                     btd = (action_15m == "BUY" and action_1h == "BUY" and rsi < 50)
                 elif market_mode == "BEAR":
-                    btd = ((action_15m == "BUY" or action_1h == "BUY") and rsi < 40)
+                    btd = ((action_15m == "BUY" or action_1h == "BUY") and rsi < 30 and bb_pct_5m < BB_PCT_MAX_BEAR)
                 elif market_mode == "RANGE":
                     # RANGE : RSI très oversold + bas de BB = rebond probable même sans TF haussier
                     btd = (rsi < 32 and bb_pct_5m < 0.20)
@@ -986,10 +1128,13 @@ class BotEngine:
 
                 # RSI — zone selon mode
                 if market_mode == "BEAR":
-                    # Aligner avec run_cycle : non-BTD exige RSI <= RSI_OVERSOLD_BEAR (42)
-                    # BTD : RSI < 40 déjà vérifié dans la détection BTD ci-dessus
-                    if not is_btd_signal and rsi > RSI_OVERSOLD_BEAR:
-                        logger.debug(f"{sym}: BEAR non-BTD RSI={rsi:.1f} > {RSI_OVERSOLD_BEAR} — skip")
+                    # RSI capitulation obligatoire (≤ 30) — plus de signaux neutres à RSI 42
+                    if rsi > RSI_OVERSOLD_BEAR:
+                        logger.debug(f"{sym}: BEAR RSI={rsi:.1f} > {RSI_OVERSOLD_BEAR} — pas en capitulation, skip")
+                        continue
+                    # Bas de BB obligatoire — prix doit être en zone de rebond réel
+                    if bb_pct_5m > BB_PCT_MAX_BEAR:
+                        logger.info(f"[{user_id}] {sym}: BEAR bb_pct={bb_pct_5m:.2f} > {BB_PCT_MAX_BEAR} — hors zone rebond BB, skip")
                         continue
                 elif market_mode == "BULL":
                     # Suracheté → toujours refuser
@@ -1164,7 +1309,7 @@ class BotEngine:
                 "4h":  best_candidate.get("confluence_4h",  "HOLD"),
             }
             try:
-                signal_data = await claude_service.analyze_market(sym, indicators, price, pf, mtf_data=mtf_data)
+                signal_data = await claude_service.analyze_market(sym, indicators, price, pf, mtf_data=mtf_data, market_mode=market_mode)
             except Exception as e:
                 logger.warning(f"Claude failed for {sym}: {e} — using rule-based")
                 signal_data = claude_service._from_rule(rule_sig, indicators)
@@ -1319,13 +1464,34 @@ class BotEngine:
         syms_needed = list({t.get("symbol") for t in open_trades})
         prices = await self._fetch_prices(syms_needed)
 
+        bot_info       = self._running_bots.get(user_id, {})
+        market_mode    = bot_info.get("market_mode", "NEUTRAL")
+        portfolio_data = {}
+        try:
+            portfolio_data = await self._get_portfolio(db, user_id)
+        except Exception:
+            pass
+
         for trade in open_trades:
             sym   = trade.get("symbol", "")
             if not sym:
                 continue
+
+            # Positions Futures gérées séparément (SL/TP côté Binance)
+            if trade.get("futures"):
+                await self._manage_futures_position(user_id, trade, db)
+                continue
+
             price = prices.get(sym)
             if not price:
                 continue
+
+            # ── BLOC B : Pyramiding — ajouter sur les gagnants ───────────────
+            pnl_pct_check = (price - float(trade.get("price", price))) / float(trade.get("price", price)) * 100 if trade.get("price") else 0
+            await self._check_pyramiding(
+                user_id, trade, price, pnl_pct_check, db, portfolio_data, market_mode
+            )
+
             await self._manage_position(user_id, trade, price, db)
 
     async def _manage_position(
@@ -1342,13 +1508,14 @@ class BotEngine:
 
         pnl_pct = (price - entry) / entry * 100
 
-        # ── PARTIAL TP : à +1.5%, ferme 50% et monte SL au breakeven ────────
+        # ── PARTIAL TP : à +0.9%, ferme 50% et monte SL au breakeven ────────
+        # Capture la moitié du profit avant retournement éventuel — WR effectif +30%
         partial_tp_price    = float(trade.get("partial_tp_price", 0))
         partial_tp_executed = bool(trade.get("partial_tp_executed", False))
         if partial_tp_price > 0 and not partial_tp_executed and price >= partial_tp_price:
             logger.info(
                 f"[{user_id}] Partial TP {trade.get('symbol','')}: "
-                f"prix={price:.4f} >= cible={partial_tp_price:.4f} (+1.5%) — fermeture 50%"
+                f"prix={price:.4f} >= cible={partial_tp_price:.4f} (+0.9%) — fermeture 50%, SL→breakeven"
             )
             await self._partial_close_position(user_id, trade, price)
             return
@@ -1394,6 +1561,19 @@ class BotEngine:
 
         if updates:
             await db.trades.update_one({"_id": trade["_id"]}, {"$set": updates})
+
+        # ── SORTIE ANTICIPÉE BEAR — lock profit à +0.7% ───────────────────────
+        # En BEAR mode le prix revient rarement au TP (1.0%) → fermer à +0.7%
+        bot_info = self._running_bots.get(user_id, {})
+        if (bot_info.get("market_mode") == "BEAR"
+                and pnl_pct >= 0.7
+                and price < tp_price):
+            logger.info(
+                f"[{user_id}] BEAR early exit {trade.get('symbol','')}: "
+                f"+{pnl_pct:.2f}% — lock profit avant retournement"
+            )
+            await self._close_position(user_id, trade, price, "bear_early_exit")
+            return
 
         # ── SORTIE ANTICIPÉE — retournement de signal (avant SL) ─────────────
         # Si 15m + 1h retournent tous les deux SELL pendant qu'on est en perte
@@ -1511,7 +1691,7 @@ class BotEngine:
             "signal_confidence":   signal_data["confidence"],
             "signal_source":       signal_data.get("source", "claude"),
             "signal_adx":          (indicators or {}).get("trend", {}).get("adx", 0),
-            "partial_tp_price":    0,     # partial TP désactivé — trailing SL gère les sorties
+            "partial_tp_price":    round(ex_price * 1.009, 8),  # partial TP à +0.9% — lock 50% tôt
             "partial_tp_executed": False,
         })
 
@@ -1547,6 +1727,259 @@ class BotEngine:
         })
         await self._broadcast(user_id, "portfolio_update", updated)
         return True
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # FUTURES — AGGRESSIVE BULL MODE (BLOC A)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _is_aggressive_bull(
+        self,
+        market_mode: str,
+        confidence: float,
+        adx: float,
+        triple_bull: bool,
+    ) -> bool:
+        """Détecte le mode Aggressive Bull : BULL fort + haute conviction + levier justifié."""
+        return (
+            FUTURES_ENABLED
+            and market_mode == "BULL"
+            and confidence >= AGGRESSIVE_BULL_MIN_CONF
+            and adx >= AGGRESSIVE_BULL_MIN_ADX
+            and triple_bull  # 5m+15m+1h tous BUY
+        )
+
+    async def _execute_futures_long(
+        self,
+        user_id: str,
+        db,
+        symbol: str,
+        signal_data: Dict,
+        current_price: float,
+        indicators: Dict,
+    ) -> bool:
+        """
+        Ouvre un LONG Futures avec levier en Aggressive Bull Mode.
+        TP=5%, SL=1%, 10x levier, position 65% du capital Futures.
+        """
+        try:
+            # Solde Futures disponible
+            futures_balance = await asyncio.get_event_loop().run_in_executor(
+                None, futures_service.get_futures_balance
+            )
+            if futures_balance < FUTURES_BALANCE_RESERVE + 1.0:
+                logger.warning(f"[{user_id}] Futures balance insuffisant: {futures_balance:.2f} USDT")
+                return False
+
+            usable = max(futures_balance - FUTURES_BALANCE_RESERVE, 0)
+            # Position = 65% du capital Futures disponible
+            notional = usable * AGGRESSIVE_BULL_POSITION_PCT * FUTURES_LEVERAGE
+            if notional < 5.0:
+                logger.warning(f"[{user_id}] Futures notional trop faible: {notional:.2f} USDT")
+                return False
+
+            tp_price = round(current_price * (1 + AGGRESSIVE_BULL_TP_PCT / 100), 8)
+            sl_price = round(current_price * (1 - AGGRESSIVE_BULL_SL_PCT / 100), 8)
+
+            logger.info(
+                f"[{user_id}] 🚀 AGGRESSIVE BULL FUTURES {symbol}: "
+                f"notional={notional:.2f} USDT levier={FUTURES_LEVERAGE}x "
+                f"TP={AGGRESSIVE_BULL_TP_PCT}% SL={AGGRESSIVE_BULL_SL_PCT}%"
+            )
+
+            order = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: futures_service.open_long(symbol, notional, current_price, FUTURES_LEVERAGE)
+            )
+            if not order:
+                return False
+
+            ex_price = order["price"]
+            ex_qty   = order["qty"]
+            tp_final = round(ex_price * (1 + AGGRESSIVE_BULL_TP_PCT / 100), 4)
+            sl_final = round(ex_price * (1 - AGGRESSIVE_BULL_SL_PCT / 100), 4)
+
+            # Placer SL + TP sur Binance Futures (ordres serveur)
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: futures_service.set_stop_loss_tp(symbol, ex_qty, sl_final, tp_final)
+            )
+
+            # Sauvegarder en MongoDB comme trade classique (tag futures=True)
+            margin_used = round(notional / FUTURES_LEVERAGE, 4)
+            now_utc = datetime.now(timezone.utc)
+            doc = {
+                "user_id":        user_id,
+                "symbol":         symbol,
+                "side":           "BUY",
+                "quantity":       ex_qty,
+                "price":          ex_price,
+                "total_usdt":     margin_used,
+                "status":         "OPEN",
+                "futures":        True,
+                "leverage":       FUTURES_LEVERAGE,
+                "notional":       round(ex_qty * ex_price, 4),
+                "take_profit_price": tp_final,
+                "stop_loss_price":   sl_final,
+                "signal_confidence": signal_data.get("confidence", 0),
+                "binance_order_id":  order["order_id"],
+                "created_at":     now_utc,
+                "opened_at":      now_utc,
+                "partial_tp_price":    0,
+                "partial_tp_executed": False,
+            }
+            await db.trades.insert_one(doc)
+
+            gain_potentiel = round(ex_qty * ex_price * AGGRESSIVE_BULL_TP_PCT / 100, 2)
+            logger.info(
+                f"[{user_id}] ✅ Futures LONG ouvert {symbol} @ {ex_price:.4f} "
+                f"levier={FUTURES_LEVERAGE}x marge={margin_used:.2f} USDT "
+                f"gain potentiel=+${gain_potentiel}"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"[{user_id}] _execute_futures_long {symbol}: {e}")
+            return False
+
+    async def _manage_futures_position(self, user_id: str, trade: Dict, db) -> None:
+        """
+        Gère une position Futures ouverte : check SL/TP via prix Futures (mark price).
+        Binance ferme automatiquement via les ordres serveur SL/TP.
+        On vérifie juste si la position est toujours ouverte sur Binance.
+        """
+        symbol = trade.get("symbol", "")
+        try:
+            position = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: futures_service.get_futures_position(symbol)
+            )
+            if position is None:
+                # Erreur API Binance — état inconnu, ne pas agir
+                logger.debug(f"[{user_id}] Futures API error pour {symbol} — skip")
+                return
+            if position:
+                # Position toujours ouverte → rien à faire (SL/TP serveur actifs)
+                return
+            # position == {} → fermée sur Binance (SL ou TP atteint côté serveur)
+                entry    = float(trade.get("price", 0))
+                notional = float(trade.get("notional", 0))
+                margin   = float(trade.get("total_usdt", 0))
+                tp_stored = float(trade.get("take_profit_price", 0))
+                sl_stored = float(trade.get("stop_loss_price", 0))
+
+                # Déterminer le prix de clôture réel (TP ou SL)
+                mark_price = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: futures_service.get_mark_price(symbol)
+                )
+                # Si le prix actuel est proche du TP → c'était un TP
+                # Si proche du SL → c'était un SL
+                # Sinon on utilise les prix stockés pour le calcul
+                if tp_stored > 0 and mark_price >= tp_stored * 0.98:
+                    close_price_used = tp_stored
+                    close_reason = "futures_tp"
+                elif sl_stored > 0 and mark_price <= sl_stored * 1.02:
+                    close_price_used = sl_stored
+                    close_reason = "futures_sl"
+                else:
+                    # Mouvement trop loin du TP/SL actuel → utiliser les ordres fermés
+                    close_price_used = mark_price
+                    close_reason = "futures_tp" if mark_price > entry else "futures_sl"
+
+                pnl_approx = round((close_price_used - entry) / entry * notional, 4) if entry > 0 else 0
+                await db.trades.update_one(
+                    {"_id": trade["_id"]},
+                    {"$set": {
+                        "status":      "CLOSED",
+                        "pnl":         pnl_approx,
+                        "pnl_pct":     round(pnl_approx / margin * 100, 4) if margin > 0 else 0,
+                        "close_price": mark_price,
+                        "close_reason": close_reason,
+                        "closed_at":   datetime.now(timezone.utc),
+                    }}
+                )
+                logger.info(
+                    f"[{user_id}] Futures position {symbol} fermée "
+                    f"({close_reason}) PnL≈{pnl_approx:+.4f} USDT"
+                )
+        except Exception as e:
+            logger.debug(f"[{user_id}] _manage_futures_position {symbol}: {e}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PYRAMIDING ENGINE (BLOC B)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _check_pyramiding(
+        self,
+        user_id: str,
+        trade: Dict,
+        price: float,
+        pnl_pct: float,
+        db,
+        portfolio_data: Dict,
+        market_mode: str,
+    ) -> None:
+        """
+        Si position en profit >= 1.5% et signal 15m toujours BUY :
+        ouvre une 2e position (25% capital restant) sur la même paire.
+        Multiplie le gain si le trend continue.
+        """
+        # Conditions pyramiding
+        if pnl_pct < 1.5:
+            return
+        if trade.get("pyramided"):
+            return  # déjà pyramidé
+        if market_mode != "BULL":
+            return  # pyramiding uniquement en BULL
+
+        bot_info = self._running_bots.get(user_id, {})
+        available = portfolio_data.get("available_usdt", 0)
+        if available < 15.0:
+            return  # pas assez de capital pour une 2e position
+
+        symbol = trade.get("symbol", "")
+        try:
+            result = await self._analyze_pair_fast(symbol)
+            if not result or len(result) < 3:
+                return
+            _, _, rule_15m = result[0], result[1], result[2]
+            if rule_15m.get("action") != "BUY":
+                logger.debug(f"[{user_id}] Pyramiding {symbol}: 15m pas BUY — skip")
+                return
+
+            # Taille de la 2e position : 25% du capital restant
+            pyramid_usdt = min(available * 0.25, 30.0)
+            pyramid_usdt = max(pyramid_usdt, 5.50)
+
+            sl_pct = 0.8
+            tp_pct = float(trade.get("take_profit_price", 0))
+            if tp_pct > 0 and price > 0:
+                tp_pct = (tp_pct - price) / price * 100
+            else:
+                tp_pct = 3.0
+
+            logger.info(
+                f"[{user_id}] 🔺 PYRAMIDING {symbol}: pnl={pnl_pct:.1f}% "
+                f"15m=BUY → 2e position {pyramid_usdt:.1f} USDT"
+            )
+
+            # Ouvrir 2e position avec tag pyramid=True
+            config = bot_info.get("config", {})
+            ok = await self._execute_buy(
+                user_id, db, symbol, pyramid_usdt, price,
+                sl_pct, tp_pct,
+                {"action": "BUY", "confidence": 0.80, "source": "pyramid"},
+                portfolio_data, config,
+                indicators=None,
+            )
+            if ok:
+                # Marquer la position originale comme pyramidée
+                await db.trades.update_one(
+                    {"_id": trade["_id"]}, {"$set": {"pyramided": True}}
+                )
+                bot_info["daily_trade_count"] = bot_info.get("daily_trade_count", 0) + 1
+                logger.info(f"[{user_id}] ✅ Pyramide ouverte sur {symbol}")
+
+        except Exception as e:
+            logger.debug(f"[{user_id}] Pyramiding check {symbol}: {e}")
 
     async def _partial_close_position(
         self, user_id: str, trade: dict, close_price: float, fraction: float = 0.50

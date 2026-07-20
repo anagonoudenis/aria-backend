@@ -12,7 +12,7 @@ MAX_RETRY = 2
 
 SYSTEM_PROMPT = """Tu es ARIA, un validateur de signaux de trading crypto expert et rigoureux.
 
-Tu reçois un signal technique pré-calculé et tu dois l'évaluer honnêtement.
+Tu reçois un signal technique pré-calculé ET le mode de marché actuel. Tu dois adapter ton évaluation au mode.
 
 Réponds UNIQUEMENT avec ce JSON exact :
 {
@@ -34,17 +34,34 @@ Réponds UNIQUEMENT avec ce JSON exact :
   }
 }
 
-RÈGLES :
-- Mode TRENDING (ADX >= 20) : BUY si RSI < 68, volume > moyenne. Confidence jusqu'à 1.0. Minimum 0.72.
-- Mode RANGING (ADX 8-20) : BUY UNIQUEMENT sur rebond support/oversold (RSI < 45, bb_pct < 0.35). Confidence 0.60-0.65. SL élargi.
-- ADX < 8 : marché trop calme → HOLD obligatoire sauf RSI < 25 (rebond extrême).
-- Confidence MINIMUM : 0.72 en TRENDING, 0.60 en RANGING. En dessous → HOLD.
-- Ratio TP/SL cible : 2.5:1 minimum. TP suggéré : 2.0-3.0%, SL : 0.7-1.2%.
-- TRENDING_DOWN + score < 7 → HOLD obligatoire.
+RÈGLES PAR MODE :
+
+MODE BULL (marché haussier confirmé 15m+1h) :
+- BUY si RSI 28-68, ADX >= 20, volume > moyenne, EMA9 > EMA21.
+- TP cible : 2.0-3.0%, SL : 0.7-1.0%, ratio 2.5:1 minimum.
+- Confidence minimum : 0.75. Score < 7 → HOLD.
+- CONFLUENCE MTF 15m+1h BUY → confidence jusqu'à 0.90.
+
+MODE BEAR (downtrend confirmé 15m+1h) :
+- BUY SEULEMENT sur capitulation : RSI ≤ 30 ET prix au bas BB (bb_pct < 0.30).
+- Objectif : rebond court de 0.8-1.0% uniquement — NE PAS viser 2%+.
+- TP cible : 0.8-1.0%, SL : 0.4-0.5%, ratio 2:1.
+- Confidence minimum : 0.70. Si conditions non remplies → HOLD obligatoire.
+- RSI divergence haussière (prix plus bas, RSI plus haut) → confidence +0.07.
+
+MODE RANGE (consolidation, ADX < 18) :
+- BUY uniquement au bas de BB (bb_pct < 0.30) avec RSI < 48.
+- TP cible : 1.0-1.5%, SL : 0.4-0.5%.
+- Confidence minimum : 0.65.
+
+MODE NEUTRAL :
+- Seuils BEAR appliqués (conservateur).
+
+RÈGLES UNIVERSELLES :
 - Score < 5 → toujours HOLD.
-- CONFLUENCE MTF 15m=BUY ET 1h=BUY : signal fort, confidence +0.08 (jusqu'à 0.92 max).
-- CONFLUENCE MTF 15m=SELL ET 1h=SELL : contre-tendance → HOLD même si 5m BUY.
-- 4h=SELL : confidence -0.05, favorise HOLD si borderline."""
+- 15m=SELL ET 1h=SELL ensemble → HOLD même si 5m BUY.
+- 4h=SELL → confidence -0.05.
+- ADX < 8 → HOLD sauf RSI < 25."""
 
 
 async def analyze_market(
@@ -53,6 +70,7 @@ async def analyze_market(
     current_price: float,
     portfolio: Dict[str, Any],
     mtf_data: Optional[Dict] = None,
+    market_mode: str = "NEUTRAL",
     retry_count: int = 0,
 ) -> Dict[str, Any]:
     """
@@ -101,25 +119,33 @@ async def analyze_market(
         elif act_4h == "SELL":
             mtf_rule = "\n⚠️ 4h = SELL → macro baissière, réduit confidence de 0.05."
 
+    # Exigences adaptées au mode marché
+    mode_rules = {
+        "BULL":    "Confidence >= 0.75 | TP 2.0-3.0% | SL 0.7-1.0% | Ratio 2.5:1",
+        "BEAR":    "Confidence >= 0.70 | RSI ≤ 30 + BB bas OBLIGATOIRE | TP 0.8-1.0% | SL 0.4-0.5% | Ratio 2:1",
+        "RANGE":   "Confidence >= 0.65 | BB bas + RSI < 48 | TP 1.0-1.5% | SL 0.4-0.5%",
+        "NEUTRAL": "Confidence >= 0.70 | Seuils BEAR appliqués | TP 0.8-1.0% | SL 0.5%",
+    }
+    mode_req = mode_rules.get(market_mode, mode_rules["NEUTRAL"])
+
     prompt = f"""Signal technique pour {symbol} — VALIDATION REQUISE
 
+MODE MARCHÉ ACTUEL : {market_mode}
 PRIX : ${current_price:.4f}  |  Capital : ${safe_portfolio['available_usdt']:.2f} USDT
 
 SIGNAL PRÉ-CALCULÉ : {r_action} (score={r_score}/15, conf={r_conf:.0%})
 Raisons : {r_reason}
 
 INDICATEURS 5m :
-RSI={rsi:.1f} {'[SURVENDU <35]' if rsi < 35 else '[SURACHETÉ >65]' if rsi > 65 else '[neutre]'}
+RSI={rsi:.1f} {'[CAPITULATION ≤30 ✓]' if rsi <= 30 else '[SURVENDU <35]' if rsi < 35 else '[SURACHETÉ >65]' if rsi > 65 else '[neutre]'}
 MACD_histo={macd_h:.6f} | EMA9={ema9:.4f} {'>' if ema9>ema21 else '<'} EMA21={ema21:.4f}
-ADX={adx:.1f} [{adx_quality}] | BB_pct={bb_pct:.2f} | Volume={vol_r:.1f}x avg | CMF={cmf:.3f}
+ADX={adx:.1f} [{adx_quality}] | BB_pct={bb_pct:.2f} {'[BAS BB ✓]' if bb_pct < 0.30 else ''} | Volume={vol_r:.1f}x avg | CMF={cmf:.3f}
 Support=${support:.4f} | Résistance=${resistance:.4f}
 Patterns: {', '.join(patterns) if patterns else 'Aucun'}{mtf_line}{mtf_rule}
 
 CONTEXTE : P&L={safe_portfolio['total_pnl_pct']:.1f}% | WinRate={safe_portfolio['win_rate']:.0f}%
 
-EXIGENCES :
-- {'Confidence >= 0.72 pour valider BUY (mode TRENDING)' if adx >= 20 else 'Confidence >= 0.60 pour valider BUY (mode RANGING — seuil adapté)'}
-- TP suggéré : {'2.0-3.0%' if adx >= 20 else '1.0-2.0%'} | SL : {'0.7-1.0%' if adx >= 20 else '0.5-0.8%'} | Ratio min 2.5:1
+EXIGENCES MODE {market_mode} : {mode_req}
 Retourne UNIQUEMENT le JSON."""
 
     try:
