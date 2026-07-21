@@ -57,7 +57,7 @@ RANGE_TP_PCT = 1.2   # RANGE : milieu de bande BB
 # ── Filtres BULL market — seuils élevés, qualité avant quantité ──────────────
 MIN_CONFIDENCE_BULL      = 0.82   # relevé 0.75→0.82 : seuls les signaux forts passent
 MIN_COMPOSITE_SCORE_BULL = 6.5   # relevé 5.5→6.5
-MIN_SCORE_RAW_BULL       = 9     # relevé 8→9
+MIN_SCORE_RAW_BULL       = 8     # ajusté 9→8 : trop restrictif
 MIN_ADX_BULL             = 25    # relevé 22→25 : tendance plus établie requise
 MIN_VOLUME_RATIO_BULL    = 1.8   # relevé 1.5→1.8 : volume fort confirme le move
 
@@ -428,12 +428,10 @@ class BotEngine:
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # ── NEUTRAL = seuils très stricts, comportement conservateur ─────────────
+        # ── NEUTRAL = seuils BEAR stricts, pas de blocage total ─────────────────
+        # Le marché NEUTRAL peut offrir de bons setups — on applique les filtres BEAR
         if market_mode == "NEUTRAL":
-            logger.info(f"[{user_id}] NEUTRAL market — cycle skip (attente confirmation BULL ou RANGE)")
-            bot_info["cycles_count"] += 1
-            bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-            return
+            logger.info(f"[{user_id}] NEUTRAL market — scan avec seuils BEAR conservateurs")
 
         # ── Garde BTC chute rapide — dump en cours ───────────────────────────────
         btc_fast_drop = await self._btc_fast_drop()
@@ -564,9 +562,9 @@ class BotEngine:
         tf_alignment  = signal_data.get("timeframe_alignment", "MODERATE")
 
         if market_mode == "BULL":
-            # 1. Confluence 4h obligatoire — le macro doit confirmer
-            if best.get("confluence_4h") != "BUY":
-                logger.info(f"[{user_id}] BULL: 4h={best.get('confluence_4h')} pas BUY — skip (macro pas alignée)")
+            # 1. Confluence 4h — bloquer uniquement si SELL (NEUTRAL 4h accepté)
+            if best.get("confluence_4h") == "SELL":
+                logger.info(f"[{user_id}] BULL: 4h=SELL — macro baissière, skip")
                 bot_info["cycles_count"] += 1
                 bot_info["last_cycle_at"] = datetime.now(timezone.utc)
                 return
@@ -598,8 +596,8 @@ class BotEngine:
         elif market_mode == "RANGE":
             # RANGE : stochastique oversold confirmé
             stoch_k = indicators.get("momentum", {}).get("stoch_k", 50)
-            if stoch_k > 25:
-                logger.info(f"[{user_id}] RANGE: Stoch K={stoch_k:.1f} > 25 — pas assez oversold, skip")
+            if stoch_k > 35:
+                logger.info(f"[{user_id}] RANGE: Stoch K={stoch_k:.1f} > 35 — pas assez oversold, skip")
                 bot_info["cycles_count"] += 1
                 bot_info["last_cycle_at"] = datetime.now(timezone.utc)
                 return
