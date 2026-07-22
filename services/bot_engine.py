@@ -46,7 +46,7 @@ TRAIL_TRIGGER_PCT  = 2.0   # trailing SL activé à +2.0% — laisse les gagnant
 TRAIL_STEP_PCT     = 0.25  # SL trail = highest × (1 - 0.25%)
 BREAKEVEN_PCT      = 1.5   # SL → entrée dès +1.5% — protège sans couper trop tôt
 STOP_LOSS_PCT      = 0.9   # SL défaut BULL
-TAKE_PROFIT_PCT    = 3.0   # TP défaut BULL — R:R 3:1 minimum
+TAKE_PROFIT_PCT    = 5.0   # TP défaut BULL — laisser les winners courir (était 3.0)
 
 # ── SL/TP spécifiques par mode — override ATR ────────────────────────────────
 BEAR_SL_PCT  = 0.5   # BEAR : coupe vite si rebond échoue
@@ -56,7 +56,7 @@ RANGE_TP_PCT = 1.2   # RANGE : milieu de bande BB
 
 # ── Filtres BULL market — seuils élevés, qualité avant quantité ──────────────
 MIN_CONFIDENCE_BULL      = 0.82   # relevé 0.75→0.82 : seuls les signaux forts passent
-MIN_COMPOSITE_SCORE_BULL = 6.5   # relevé 5.5→6.5
+MIN_COMPOSITE_SCORE_BULL = 6.0   # abaissé 6.5→6.0 : laisser passer plus de setups valides
 MIN_SCORE_RAW_BULL       = 8     # ajusté 9→8 : trop restrictif
 MIN_ADX_BULL             = 25    # relevé 22→25 : tendance plus établie requise
 MIN_VOLUME_RATIO_BULL    = 1.8   # relevé 1.5→1.8 : volume fort confirme le move
@@ -93,7 +93,7 @@ SL_COOLDOWN_SECONDS      = 90 * 60  # 90 min cooldown après SL (était 45 min)
 MIN_TRADE_INTERVAL_SECS  = 20 * 60  # 20 min entre trades — qualité > quantité
 DAILY_MAX_LOSS_PCT        = 1.0     # stoppe à -1% jour (était 1.2%)
 MAX_DAILY_TRADES          = 6       # max 6 trades/jour — moins c'est plus (était 18)
-DAILY_PROFIT_LOCK_PCT     = 2.0     # verrouille les gains si +2% du capital en une journée
+DAILY_PROFIT_LOCK_PCT     = 5.0     # verrouille les gains si +5% du capital en une journée (était 2%)
 
 # ── FUTURES / LEVIER ────────────────────────────────────────────────────────
 FUTURES_ENABLED          = True     # active le trading avec levier en mode Aggressive Bull
@@ -102,8 +102,8 @@ FUTURES_BALANCE_RESERVE  = 2.0     # garder 2 USDT non engagés comme marge de s
 MAX_DAILY_LOSS_FUTURES   = 8.0     # arrêt total Futures si perte > 8 USDT/jour
 
 # ── AGGRESSIVE BULL MODE ────────────────────────────────────────────────────
-AGGRESSIVE_BULL_MIN_CONF    = 0.85  # confiance minimale pour mode agressif
-AGGRESSIVE_BULL_MIN_ADX     = 30    # ADX minimum — tendance forte requise
+AGGRESSIVE_BULL_MIN_CONF    = 0.80  # abaissé 0.85→0.80 pour plus de trades Futures
+AGGRESSIVE_BULL_MIN_ADX     = 25    # abaissé 30→25 pour capter plus de setups
 AGGRESSIVE_BULL_POSITION_PCT = 0.65 # 65% du capital Futures engagé
 AGGRESSIVE_BULL_TP_PCT       = 5.0  # TP 5% — ride le trend
 AGGRESSIVE_BULL_SL_PCT       = 1.0  # SL 1% — coupe vite si ça retourne
@@ -557,50 +557,14 @@ class BotEngine:
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # ── 8b. Filtres de confirmation techniques — BULL uniquement ─────────────
+        # ── 8b. Filtre régime TRENDING_DOWN — non présent dans le scan ─────────────
+        # EMA9/MACD/4h/RSI/Stoch déjà filtrés dans _scan_best_opportunity — pas de doublon
         market_regime = signal_data.get("market_regime", "RANGING")
-        tf_alignment  = signal_data.get("timeframe_alignment", "MODERATE")
-
-        if market_mode == "BULL":
-            # 1. Confluence 4h — bloquer uniquement si SELL (NEUTRAL 4h accepté)
-            if best.get("confluence_4h") == "SELL":
-                logger.info(f"[{user_id}] BULL: 4h=SELL — macro baissière, skip")
-                bot_info["cycles_count"] += 1
-                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-                return
-
-            # 2. EMA9 > EMA21 — structure haussière sur 5m
-            ema9_v  = indicators.get("trend", {}).get("ema_9", 0)
-            ema21_v = indicators.get("trend", {}).get("ema_21", 0)
-            if ema9_v > 0 and ema21_v > 0 and ema9_v < ema21_v:
-                logger.info(f"[{user_id}] BULL: EMA9({ema9_v:.4f}) < EMA21({ema21_v:.4f}) — tendance 5m baissière, skip")
-                bot_info["cycles_count"] += 1
-                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-                return
-
-            # 3. MACD histogram positif — momentum haussier actif
-            macd_hist = indicators.get("trend", {}).get("macd_histogram", 0)
-            if macd_hist <= 0:
-                logger.info(f"[{user_id}] BULL: MACD histogram={macd_hist:.6f} ≤ 0 — momentum absent, skip")
-                bot_info["cycles_count"] += 1
-                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-                return
-
-            # 4. TRENDING_DOWN bloqué sans buy_the_dip
-            if market_regime == "TRENDING_DOWN" and not is_btd:
-                logger.info(f"[{user_id}] BULL: régime TRENDING_DOWN sans BTD — skip")
-                bot_info["cycles_count"] += 1
-                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-                return
-
-        elif market_mode == "RANGE":
-            # RANGE : stochastique oversold confirmé
-            stoch_k = indicators.get("momentum", {}).get("stoch_k", 50)
-            if stoch_k > 35:
-                logger.info(f"[{user_id}] RANGE: Stoch K={stoch_k:.1f} > 35 — pas assez oversold, skip")
-                bot_info["cycles_count"] += 1
-                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-                return
+        if market_mode == "BULL" and market_regime == "TRENDING_DOWN" and not is_btd:
+            logger.info(f"[{user_id}] BULL: régime TRENDING_DOWN sans BTD — skip")
+            bot_info["cycles_count"] += 1
+            bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+            return
 
         # ── 9. Validation risk manager ────────────────────────────────────────
         is_valid, reason = risk_manager.validate_trade(
@@ -626,10 +590,10 @@ class BotEngine:
             logger.info(f"[{user_id}] BEAR bounce-scalp SL={sl_pct}% TP={tp_pct}% R:R=2:1")
 
         elif market_mode == "RANGE":
-            # Range scalping : SL ATR ajusté, TP vers milieu BB, R:R minimum 3:1
+            # Range scalping : SL ATR ajusté [0.4-0.7%], TP vers milieu BB, R:R minimum 4:1
             if atr > 0 and current_price > 0:
                 raw_sl = (atr / current_price) * 100
-                sl_pct = round(max(min(raw_sl, 0.4), RANGE_SL_PCT), 3)
+                sl_pct = round(max(min(raw_sl, 0.7), RANGE_SL_PCT), 3)  # [0.4%, 0.7%]
             else:
                 sl_pct = RANGE_SL_PCT  # 0.4%
             bb_upper_v = indicators.get("volatility", {}).get("bb_upper", 0)
@@ -637,19 +601,19 @@ class BotEngine:
             if bb_upper_v > 0 and bb_lower_v > 0 and current_price > 0:
                 bb_mid_v = (bb_upper_v + bb_lower_v) / 2
                 dist_mid = max((bb_mid_v - current_price) / current_price * 100, 0)
-                # 90% du chemin vers la médiane, min R:R 3:1
-                tp_pct = round(max(dist_mid * 0.90, sl_pct * 3.0), 3)
+                # 95% du chemin vers la médiane, min R:R 4:1 — plus ambitieux
+                tp_pct = round(max(dist_mid * 0.95, sl_pct * 4.0), 3)
             else:
-                tp_pct = round(sl_pct * 3.0, 3)
+                tp_pct = round(sl_pct * 4.0, 3)
             logger.info(f"[{user_id}] RANGE scalp SL={sl_pct}% TP={tp_pct}% R:R={tp_pct/sl_pct:.1f}:1")
 
         else:
             # BULL — trend following ATR dynamique, R:R minimum 3:1
             if atr > 0 and current_price > 0:
                 raw_sl = (1.0 * atr / current_price) * 100
-                raw_tp = (3.5 * atr / current_price) * 100
+                raw_tp = (6.0 * atr / current_price) * 100
                 sl_pct = round(max(min(raw_sl, 0.9), 0.6), 3)    # SL [0.6%, 0.9%]
-                tp_pct = round(max(min(raw_tp, 5.0), max(2.2, sl_pct * 3.0)), 3)
+                tp_pct = round(max(min(raw_tp, 8.0), max(3.5, sl_pct * 5.0)), 3)
                 logger.info(
                     f"[{user_id}] ATR SL={sl_pct}% TP={tp_pct}% ratio={tp_pct/sl_pct:.1f}:1 conf={conf:.0%} [BULL]"
                 )
@@ -658,10 +622,10 @@ class BotEngine:
                 tp_pct = TAKE_PROFIT_PCT  # 2.5%
                 logger.info(f"[{user_id}] Default SL={sl_pct}% TP={tp_pct}% [BULL]")
 
-            # R:R minimal 3:1 en BULL — garanti
-            if tp_pct / sl_pct < 3.0:
-                tp_pct = round(sl_pct * 3.0, 3)
-                logger.info(f"[{user_id}] R:R ajusté → SL={sl_pct}% TP={tp_pct}% (3:1 garanti)")
+            # R:R minimal 5:1 en BULL — garanti
+            if tp_pct / sl_pct < 5.0:
+                tp_pct = round(sl_pct * 5.0, 3)
+                logger.info(f"[{user_id}] R:R ajusté → SL={sl_pct}% TP={tp_pct}% (5:1 garanti)")
 
         # TP étendu pour setups de très haute qualité (BB Squeeze + ADX fort + triple bull)
         _bb_sq = indicators.get("volatility", {}).get("bb_squeeze", False)
@@ -670,7 +634,7 @@ class BotEngine:
         _adx_r = indicators.get("trend", {}).get("adx_rising", False)
         _triple = best.get("triple_bull", False) if best else False
         if _bb_sq and _bb_ex and _adx_v > 25 and _triple:
-            extended_tp = round(sl_pct * 3.5, 3)
+            extended_tp = round(sl_pct * 7.0, 3)
             if extended_tp > tp_pct:
                 logger.info(
                     f"[{user_id}] TP étendu setup premium "
@@ -731,11 +695,30 @@ class BotEngine:
             f"(WR={win_rate_pct:.0f}% kelly_mult={kelly_mult:.2f} consec_losses={consecutive}){quality_label}"
         )
 
-        # ── 12. Pullback entry — attendre EMA9 si prix trop haut ─────────────
-        # Non applicable en RANGE ni BEAR : en BEAR RSI≤30 = déjà sous EMA9 par définition
+        # ── 12. Futures — évalué EN PREMIER, indépendamment de la position vs EMA9 ──
+        # Bug corrigé : Futures était dans le bloc else du pullback → jamais évalué en bull
+        adx_for_agg    = indicators.get("trend", {}).get("adx", 0)
+        triple_for_agg = best.get("triple_bull", False) if best else False
+        use_futures = self._is_aggressive_bull(
+            market_mode, signal_data.get("confidence", 0), adx_for_agg, triple_for_agg
+        )
+        if use_futures:
+            futures_ok = await self._execute_futures_long(
+                user_id, db, symbol, signal_data, current_price, indicators
+            )
+            if futures_ok:
+                bot_info["last_trade_at"]     = datetime.now(timezone.utc)
+                bot_info["daily_trade_count"] = bot_info.get("daily_trade_count", 0) + 1
+                logger.info(f"[{user_id}] Futures LONG execute — skip trade Spot")
+                bot_info["cycles_count"] += 1
+                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
+                return  # Futures pris → pas de trade Spot en plus
+
+        # ── 13. Spot — Pullback entry si prix très au-dessus EMA9 (>1.2%) ────
+        # Seuil relevé 0.3%→1.2% : évite de bloquer tous les trades en bull market
         ema9 = indicators.get("trend", {}).get("ema_9", 0)
-        if ema9 > 0 and current_price > ema9 * 1.003 and market_mode not in ("RANGE", "BEAR"):
-            # Prix > EMA9 + 0.3% → attendre un pullback vers EMA9
+        if ema9 > 0 and current_price > ema9 * 1.012 and market_mode not in ("RANGE", "BEAR"):
+            # Prix > EMA9 + 1.2% → attendre un pullback vers EMA9
             bot_info["pending_entry"] = {
                 "symbol":        symbol,
                 "target_entry":  round(ema9, 8),
@@ -749,28 +732,10 @@ class BotEngine:
             }
             logger.info(
                 f"[{user_id}] Pullback pending {symbol}: "
-                f"prix={current_price:.4f} > EMA9={ema9:.4f} — attente retour"
+                f"prix={current_price:.4f} > EMA9+1.2%={ema9*1.012:.4f} — attente retour"
             )
         else:
-            # ── BLOC A : Aggressive Bull Mode — trade Futures avec levier ──────
-            adx_for_agg  = indicators.get("trend", {}).get("adx", 0)
-            triple_for_agg = best.get("triple_bull", False) if best else False
-            use_futures = self._is_aggressive_bull(
-                market_mode, signal_data.get("confidence", 0), adx_for_agg, triple_for_agg
-            )
-            if use_futures:
-                futures_ok = await self._execute_futures_long(
-                    user_id, db, symbol, signal_data, current_price, indicators
-                )
-                if futures_ok:
-                    bot_info["last_trade_at"]     = datetime.now(timezone.utc)
-                    bot_info["daily_trade_count"] = bot_info.get("daily_trade_count", 0) + 1
-                    logger.info(f"[{user_id}] 🚀 Futures LONG exécuté — skip trade Spot")
-                    bot_info["cycles_count"] += 1
-                    bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-                    return  # Futures pris → pas de trade Spot en plus
-
-            # Prix deja proche ou sous EMA9 → entree Spot immédiate (si capital Spot suffisant)
+            # Prix proche ou sous EMA9+1.2% → entrée Spot immédiate
             if available_usdt >= 5.5:
                 buy_ok = await self._execute_buy(
                     user_id, db, symbol, position_usdt, current_price,
@@ -778,10 +743,10 @@ class BotEngine:
                     indicators=indicators,
                 )
                 if buy_ok:
-                    bot_info["last_trade_at"]    = datetime.now(timezone.utc)
+                    bot_info["last_trade_at"]     = datetime.now(timezone.utc)
                     bot_info["daily_trade_count"] = bot_info.get("daily_trade_count", 0) + 1
             else:
-                logger.info(f"[{user_id}] Spot insuffisant ({available_usdt:.2f}) — trade Spot ignoré")
+                logger.info(f"[{user_id}] Spot insuffisant ({available_usdt:.2f}) — trade Spot ignore")
 
         bot_info["cycles_count"] += 1
         bot_info["last_cycle_at"] = datetime.now(timezone.utc)
@@ -1348,11 +1313,12 @@ class BotEngine:
         scored.sort(key=lambda x: x["score"], reverse=True)
         pf = portfolio_data or {}
 
+        # NEUTRAL utilise seuils BEAR (cohérent avec run_cycle ligne 538)
         min_conf_seuil  = (MIN_CONFIDENCE_RANGE    if market_mode == "RANGE"
-                           else MIN_CONFIDENCE_BEAR  if market_mode == "BEAR"
+                           else MIN_CONFIDENCE_BEAR  if market_mode in ("BEAR", "NEUTRAL")
                            else MIN_CONFIDENCE_BULL)
         min_score_seuil = (MIN_COMPOSITE_SCORE_RANGE if market_mode == "RANGE"
-                           else MIN_COMPOSITE_SCORE_BEAR if market_mode == "BEAR"
+                           else MIN_COMPOSITE_SCORE_BEAR if market_mode in ("BEAR", "NEUTRAL")
                            else MIN_COMPOSITE_SCORE_BULL)
 
         for best_candidate in scored[:3]:
@@ -1596,19 +1562,19 @@ class BotEngine:
             await self._partial_close_position(user_id, trade, price)
             return
 
-        # Trailing step adaptatif — élargi pour éviter les sorties prématurées sur micro-reculs crypto
-        # Problème corrigé : trail 0.20-0.25% se déclenchait sur volatilité normale → avg win $0.063 au lieu de $0.138
+        # Trailing step adaptatif — TP cible 5%, trailing doit laisser respirer la position
+        # Avec TP à 5% les micro-retracements 0.3-0.5% sont normaux → steps plus larges
         adx_entry  = float(trade.get("signal_adx", 0) or 0)
-        if pnl_pct >= 2.0:
-            trail_step = 0.30   # près du TP : assez serré pour protéger (était 0.20, trop serré)
-        elif pnl_pct >= 1.5:
-            trail_step = 0.35   # bon profit : laisse respirer sans tout donner (était 0.22)
-        elif pnl_pct >= 1.0:
-            trail_step = 0.45   # activation initiale : +0.45% de marge évite les faux triggers (était 0.25)
+        if pnl_pct >= 4.0:
+            trail_step = 0.35   # très près du TP 5% : serré pour protéger les gains
+        elif pnl_pct >= 3.0:
+            trail_step = 0.50   # bon profit : laisse respirer le trend
+        elif pnl_pct >= 2.0:
+            trail_step = 0.65   # trailing vient d'activer : large marge pour éviter faux trigger
         elif adx_entry > 35:
-            trail_step = 0.50   # tendance forte : marge généreuse (était 0.28)
+            trail_step = 0.75   # tendance forte : le prix peut retracer plus sans inverser
         else:
-            trail_step = 0.55   # position naissante : hors zone trailing de toute façon (était 0.30)
+            trail_step = 0.80   # position naissante : hors zone trailing de toute façon
 
         # Mettre à jour le plus haut
         updates = {}
@@ -1653,11 +1619,11 @@ class BotEngine:
 
         # ── SORTIE ANTICIPÉE — retournement de signal (avant SL) ─────────────
         # Si 15m + 1h retournent tous les deux SELL pendant qu'on est en perte
-        # → sortir tôt à -0.2/-0.5% plutôt qu'attendre le SL complet à -0.9%
-        if pnl_pct < -0.15 and price > sl_price:
+        # → sortir tôt à -0.1% plutôt qu'attendre le SL complet à -0.9%
+        if pnl_pct < -0.10 and price > sl_price:
             now_ts    = datetime.now(timezone.utc).timestamp()
             last_check = float(trade.get("last_signal_check_ts") or 0)
-            if now_ts - last_check >= 300:  # vérif max toutes les 5 min
+            if now_ts - last_check >= 120:  # vérif max toutes les 2 min
                 try:
                     sym    = trade.get("symbol", "")
                     result = await self._analyze_pair_fast(sym)
@@ -1736,20 +1702,7 @@ class BotEngine:
         tp_price = ex_price * (1 + tp_pct / 100)
         sl_price = ex_price * (1 - sl_pct / 100)
 
-        # Ajustement TP selon résistance proche — éviter de se faire rejeter
-        if indicators:
-            resistance = indicators.get("levels", {}).get("resistance", 0)
-            if resistance > ex_price * 1.005:
-                dist_res_pct = (resistance - ex_price) / ex_price * 100
-                if dist_res_pct < tp_pct:
-                    # Résistance avant le TP → viser juste en dessous
-                    adj_tp_pct = max(dist_res_pct * 0.90, sl_pct * 2.2)
-                    if adj_tp_pct < tp_pct:
-                        tp_price = ex_price * (1 + adj_tp_pct / 100)
-                        logger.info(
-                            f"[{user_id}] TP ajusté sous résistance {resistance:.4f}: "
-                            f"{tp_pct:.2f}% → {adj_tp_pct:.2f}%"
-                        )
+        # Résistance : ne pas abaisser le TP — le trailing SL protège si le prix stagne à la résistance
 
         trade = TradeInDB(
             user_id=user_id, symbol=symbol, side=TradeSide("BUY"),
@@ -1767,7 +1720,7 @@ class BotEngine:
             "signal_confidence":   signal_data["confidence"],
             "signal_source":       signal_data.get("source", "claude"),
             "signal_adx":          (indicators or {}).get("trend", {}).get("adx", 0),
-            "partial_tp_price":    round(ex_price * 1.020, 8),  # partial TP à +2.0% — momentum établi avant close
+            "partial_tp_price":    0,  # partial TP désactivé — toute la position court jusqu'au vrai TP
             "partial_tp_executed": False,
         })
 
