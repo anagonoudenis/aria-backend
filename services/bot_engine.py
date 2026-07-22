@@ -1075,7 +1075,7 @@ class BotEngine:
             rsi        = momentum.get("rsi", 50)
             adx        = trend_5m.get("adx", 0)
             vol_ratio  = volume_ind.get("vol_ratio", 1.0)
-            macd_h        = trend_5m.get("macd_histogram", 0)
+            macd_h         = trend_5m.get("macd_histogram", 0)
             volatility_ind = indicators_5m.get("volatility", {})
             bb_pct_5m      = volatility_ind.get("bb_pct", 0.5)
 
@@ -1178,14 +1178,17 @@ class BotEngine:
                         logger.info(f"[{user_id}] {sym}: BEAR bb_pct={bb_pct_5m:.2f} > {BB_PCT_MAX_BEAR} — hors zone rebond BB, skip")
                         continue
                 elif market_mode == "BULL":
-                    # Suracheté → toujours refuser
-                    if rsi > 72:
-                        logger.debug(f"{sym}: BULL RSI={rsi:.1f} > 72 (suracheté) — skip")
+                    # RSI > 60 = déjà trop monté, pas de place pour atteindre TP — skip
+                    if rsi > 60:
+                        logger.info(f"[{user_id}] {sym}: BULL RSI={rsi:.1f} > 60 (étendu, plus de place pour TP) — skip")
                         continue
                     # RSI 20-27 sans contexte extrême → refuser (signal faible)
-                    # RSI < 20 (is_extreme_oversold) → autoriser (flash crash recovery)
                     if rsi < 28 and not is_extreme_oversold:
                         logger.debug(f"{sym}: BULL RSI={rsi:.1f} < 28 non-extreme — skip")
+                        continue
+                    # Prix en haut des BB (bb_pct > 0.65) = près de la résistance — skip
+                    if bb_pct_5m > 0.65 and not is_btd_signal:
+                        logger.info(f"[{user_id}] {sym}: BULL bb_pct={bb_pct_5m:.2f} > 0.65 (haut BB, près résistance) — skip")
                         continue
                 elif market_mode == "RANGE":
                     if rsi > RSI_MAX_RANGE:
@@ -1200,9 +1203,9 @@ class BotEngine:
                         logger.info(f"[{user_id}] {sym}: NEUTRAL RSI={rsi:.1f} hors 25-75 — skip")
                         continue
 
-                # MACD requis seulement en BULL
-                if market_mode == "BULL" and macd_h <= 0:
-                    logger.debug(f"{sym}: BULL MACD_h={macd_h:.6f} <= 0 — skip")
+                # MACD requis en BULL pour signaux directs — BTD exempté car pullback = MACD momentanément négatif
+                if market_mode == "BULL" and macd_h <= 0 and not is_btd_signal:
+                    logger.debug(f"{sym}: BULL MACD_h={macd_h:.6f} <= 0 (non-BTD) — skip")
                     continue
 
                 # Anti-chasing — désactivé pour buy_the_dip (on veut les rebonds)
@@ -1213,7 +1216,7 @@ class BotEngine:
                         prev_c = candles[-2]
                         if prev_c.get("close", 0) > 0:
                             last_move = (last_c.get("close",0) - prev_c.get("close",0)) / prev_c.get("close",0) * 100
-                            if last_move > 2.0:
+                            if last_move > 1.2:
                                 logger.info(f"[{user_id}] {sym}: chasing +{last_move:.2f}% — skip")
                                 continue
 
@@ -1290,7 +1293,17 @@ class BotEngine:
                 logger.info(f"[{user_id}] {sym}: BULL sans confluence 15m/1h — skip")
                 continue
 
-            score = round(effective_score * confluence_mult, 1)
+            # Bonus RSI entrée : RSI bas = plus de place pour monter au TP
+            if rsi <= 38:
+                rsi_quality = 1.20   # zone oversold = excellent point d'entrée
+            elif rsi <= 45:
+                rsi_quality = 1.12
+            elif rsi <= 52:
+                rsi_quality = 1.05
+            else:
+                rsi_quality = 0.90   # RSI 52-60 = entrée suboptimale, score réduit
+
+            score = round(effective_score * confluence_mult * rsi_quality, 1)
 
             scored.append({
                 "symbol":         sym,
