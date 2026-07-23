@@ -38,6 +38,7 @@ BANNED_PAIRS = {
     "MUBUSDT", "GRAMUSDT", "OPGUSDT",                # grosses pertes isolées
     "SHIBUSDT", "MATICUSDT", "LDOUSDT", "FTMUSDT",   # tokens faible qualité
     "RNDRUSDT", "WIFUSDT",                           # mèmes/hype, WR < 25%
+    "KITEUSDT",                                      # paire volatile ajoutée par hot_pairs — banni
 }
 PAIR_EXTRA_FILTERS: Dict[str, Dict] = {}  # réservé pour futures paires à seuils renforcés
 
@@ -988,16 +989,9 @@ class BotEngine:
                 # Hot pairs : variation > 3% + volume > 20M + symbole <= 10 chars
                 # Seuils stricts pour éviter tokens manipulés (SPCXB/DEXE/WLD type)
                 scan_set = set(SCAN_PAIRS)
-                hot = [
-                    p["symbol"] for p in all_pairs[:80]
-                    if p["symbol"] not in scan_set
-                    and p["symbol"] not in BANNED_PAIRS
-                    and abs(p.get("change_pct", 0)) > 3.0
-                    and p.get("volume_usdt", 0) > 20_000_000
-                    and p["symbol"].endswith("USDT")
-                    and p["symbol"].isascii()
-                    and len(p["symbol"]) <= 10
-                ][:5]
+                # Hot pairs désactivées — ajouter des paires ayant déjà +3% = chasser les pompes
+                # On reste strictement sur SCAN_PAIRS (18 paires liquides et connues)
+                hot = []
                 cache["pairs"] = hot
                 cache["last_update"] = now
                 if hot:
