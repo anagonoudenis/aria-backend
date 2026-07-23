@@ -109,6 +109,17 @@ AGGRESSIVE_BULL_POSITION_PCT = 0.65 # 65% du capital Futures engagé
 AGGRESSIVE_BULL_TP_PCT       = 5.0  # TP 5% — ride le trend
 AGGRESSIVE_BULL_SL_PCT       = 1.0  # SL 1% — coupe vite si ça retourne
 
+# ── STRATÉGIE V2 — 1h RSI Recovery ─────────────────────────────────────────
+RSI_1H_OVERSOLD       = 40    # RSI 1h < 40 = zone oversold, candidat à rebond
+RSI_1H_RECOVERY_MIN   = 3.0   # récupération minimale RSI sur 3 bougies 1h
+SPOT_SL_PCT_V2        = 1.5   # SL Spot V2 — plus large pour tenir les rebonds 1h
+SPOT_TP_PCT_V2        = 4.0   # TP Spot V2 — R:R 2.67:1
+FUTURES_BTC_MOVE_MIN  = 2.0   # BTC 1h move ≥ +2% pour trigger Futures V2
+FUTURES_BTC_RSI_MAX   = 65    # BTC RSI 1h < 65 — pas surchauffé
+FUTURES_LEVERAGE_V2   = 5     # 5x levier — plus prudent que 10x
+FUTURES_SL_PCT_V2     = 2.0   # SL Futures V2 — 2% (était 1%)
+CLAUDE_MIN_CONF_V2    = 0.72  # confiance Claude minimale pour valider un signal V2
+
 _active_cycles: set = set()
 
 # Cache paires à fort momentum (rafraîchi toutes les 15 min)
@@ -420,19 +431,13 @@ class BotEngine:
         bot_info["market_mode"] = market_mode
         logger.info(f"[{user_id}] Mode marche: {market_mode} — {btc_reason}")
 
-        # ── BEAR = arrêt total des nouvelles positions Spot ───────────────────────
-        # WR 27% en BEAR prouve que les rebonds sont imprévisibles en downtrend.
-        # On préserve le capital et on attend BULL ou RANGE.
-        if market_mode == "BEAR":
-            logger.info(f"[{user_id}] BEAR market — aucun nouveau trade Spot (capital préservé)")
+        # ── Filtre macro BTC 4h SMA50 — pas d'entrée si BTC sous SMA50 ──────────────
+        btc_above_macro = await self._check_btc_4h_macro()
+        if not btc_above_macro:
+            logger.info(f"[{user_id}] BTC sous SMA50 4h — macro bearish, pas de nouvelles entrées")
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
-
-        # ── NEUTRAL = seuils BEAR stricts, pas de blocage total ─────────────────
-        # Le marché NEUTRAL peut offrir de bons setups — on applique les filtres BEAR
-        if market_mode == "NEUTRAL":
-            logger.info(f"[{user_id}] NEUTRAL market — scan avec seuils BEAR conservateurs")
 
         # ── Garde BTC chute rapide — dump en cours ───────────────────────────────
         btc_fast_drop = await self._btc_fast_drop()
@@ -455,10 +460,9 @@ class BotEngine:
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # ── 6. SCAN MULTI-PAIRES — meilleure opportunité ──────────────────────
-        best = await self._scan_best_opportunity(
-            user_id, SCAN_PAIRS, open_symbols, prices, config, portfolio_data,
-            market_mode=market_mode,
+        # ── 6. SCAN 1h RSI Recovery — meilleure opportunité V2 ───────────────────
+        best = await self._scan_1h_rsi_recovery(
+            user_id, open_symbols, prices, config, portfolio_data
         )
 
         if best is None:
@@ -497,72 +501,17 @@ class BotEngine:
             **signal_data, "symbol": symbol, "price": current_price
         })
 
-        # ── 8. Filtres qualité adaptés au mode marché ─────────────────────────
+        # ── 8. Validation signal V2 — confiance Claude ───────────────────────────
         if signal_data["action"] != "BUY":
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # Seuils selon mode marché
-        is_btd = best.get("buy_the_dip", False)   # signal buy-the-dip ?
-
-        if market_mode == "BULL":
-            min_conf  = MIN_CONFIDENCE_BULL
-            min_score = MIN_COMPOSITE_SCORE_BULL
-        elif market_mode == "BEAR":
-            min_conf  = MIN_CONFIDENCE_BEAR
-            min_score = MIN_COMPOSITE_SCORE_BEAR
-            # RSI capitulation obligatoire (≤ 30) pour tous les signaux BEAR
-            rsi_chk    = indicators.get("momentum", {}).get("rsi", 50)
-            bb_pct_chk = indicators.get("volatility", {}).get("bb_pct", 0.5)
-            if rsi_chk > RSI_OVERSOLD_BEAR:
-                logger.info(f"[{user_id}] BEAR RSI {rsi_chk:.1f} > {RSI_OVERSOLD_BEAR} — pas en capitulation, refuse")
-                bot_info["cycles_count"] += 1
-                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-                return
-            if bb_pct_chk > BB_PCT_MAX_BEAR:
-                logger.info(f"[{user_id}] BEAR bb_pct={bb_pct_chk:.2f} > {BB_PCT_MAX_BEAR} — hors zone rebond, refuse")
-                bot_info["cycles_count"] += 1
-                bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-                return
-        elif market_mode == "RANGE":
-            min_conf  = MIN_CONFIDENCE_RANGE
-            min_score = MIN_COMPOSITE_SCORE_RANGE
-            # RANGE : acheter uniquement en zone basse (RSI < RSI_MAX_RANGE = 52)
-            if not is_btd:
-                rsi_chk = indicators.get("momentum", {}).get("rsi", 50)
-                if rsi_chk > RSI_MAX_RANGE:
-                    logger.info(f"[{user_id}] RANGE RSI {rsi_chk:.1f} > {RSI_MAX_RANGE} — hors zone achat range, ignore")
-                    bot_info["cycles_count"] += 1
-                    bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-                    return
-        else:  # NEUTRAL
-            min_conf  = MIN_CONFIDENCE_BEAR   # utiliser seuils BEAR (conservative)
-            min_score = MIN_COMPOSITE_SCORE_BEAR
-
-        if signal_data["confidence"] < min_conf:
+        if signal_data["confidence"] < CLAUDE_MIN_CONF_V2:
             logger.info(
                 f"[{user_id}] Confiance {signal_data['confidence']:.0%} "
-                f"< {min_conf:.0%} ({market_mode}) — signal ignore"
+                f"< {CLAUDE_MIN_CONF_V2:.0%} — signal V2 ignoré"
             )
-            bot_info["cycles_count"] += 1
-            bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-            return
-
-        if best["composite_score"] < min_score:
-            logger.info(
-                f"[{user_id}] Score {best['composite_score']:.1f} "
-                f"< {min_score} ({market_mode}) — signal ignore"
-            )
-            bot_info["cycles_count"] += 1
-            bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-            return
-
-        # ── 8b. Filtre régime TRENDING_DOWN — non présent dans le scan ─────────────
-        # EMA9/MACD/4h/RSI/Stoch déjà filtrés dans _scan_best_opportunity — pas de doublon
-        market_regime = signal_data.get("market_regime", "RANGING")
-        if market_mode == "BULL" and market_regime == "TRENDING_DOWN" and not is_btd:
-            logger.info(f"[{user_id}] BULL: régime TRENDING_DOWN sans BTD — skip")
             bot_info["cycles_count"] += 1
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
@@ -579,69 +528,12 @@ class BotEngine:
             bot_info["last_cycle_at"] = datetime.now(timezone.utc)
             return
 
-        # ── 10. SL/TP — stratégie adaptée au mode marché ────────────────────
-        conf = signal_data["confidence"]
-        atr  = indicators.get("volatility", {}).get("atr", 0)
-
-        if market_mode == "BEAR":
-            # Bounce scalping : TP réaliste 1%, SL serré 0.5% — R:R 2:1
-            # En downtrend les rebonds durent peu — prendre profit vite
-            sl_pct = BEAR_SL_PCT   # 0.5%
-            tp_pct = BEAR_TP_PCT   # 1.0%
-            logger.info(f"[{user_id}] BEAR bounce-scalp SL={sl_pct}% TP={tp_pct}% R:R=2:1")
-
-        elif market_mode == "RANGE":
-            # Range scalping : SL ATR ajusté [0.4-0.7%], TP vers milieu BB, R:R minimum 4:1
-            if atr > 0 and current_price > 0:
-                raw_sl = (atr / current_price) * 100
-                sl_pct = round(max(min(raw_sl, 0.7), RANGE_SL_PCT), 3)  # [0.4%, 0.7%]
-            else:
-                sl_pct = RANGE_SL_PCT  # 0.4%
-            bb_upper_v = indicators.get("volatility", {}).get("bb_upper", 0)
-            bb_lower_v = indicators.get("volatility", {}).get("bb_lower", 0)
-            if bb_upper_v > 0 and bb_lower_v > 0 and current_price > 0:
-                bb_mid_v = (bb_upper_v + bb_lower_v) / 2
-                dist_mid = max((bb_mid_v - current_price) / current_price * 100, 0)
-                # 95% du chemin vers la médiane, min R:R 4:1 — plus ambitieux
-                tp_pct = round(max(dist_mid * 0.95, sl_pct * 4.0), 3)
-            else:
-                tp_pct = round(sl_pct * 4.0, 3)
-            logger.info(f"[{user_id}] RANGE scalp SL={sl_pct}% TP={tp_pct}% R:R={tp_pct/sl_pct:.1f}:1")
-
-        else:
-            # BULL — trend following ATR dynamique, R:R minimum 3:1
-            if atr > 0 and current_price > 0:
-                raw_sl = (1.0 * atr / current_price) * 100
-                raw_tp = (6.0 * atr / current_price) * 100
-                sl_pct = round(max(min(raw_sl, 0.9), 0.6), 3)    # SL [0.6%, 0.9%]
-                tp_pct = round(max(min(raw_tp, 8.0), max(3.5, sl_pct * 5.0)), 3)
-                logger.info(
-                    f"[{user_id}] ATR SL={sl_pct}% TP={tp_pct}% ratio={tp_pct/sl_pct:.1f}:1 conf={conf:.0%} [BULL]"
-                )
-            else:
-                sl_pct = STOP_LOSS_PCT    # 0.9%
-                tp_pct = TAKE_PROFIT_PCT  # 2.5%
-                logger.info(f"[{user_id}] Default SL={sl_pct}% TP={tp_pct}% [BULL]")
-
-            # R:R minimal 5:1 en BULL — garanti
-            if tp_pct / sl_pct < 5.0:
-                tp_pct = round(sl_pct * 5.0, 3)
-                logger.info(f"[{user_id}] R:R ajusté → SL={sl_pct}% TP={tp_pct}% (5:1 garanti)")
-
-        # TP étendu pour setups de très haute qualité (BB Squeeze + ADX fort + triple bull)
-        _bb_sq = indicators.get("volatility", {}).get("bb_squeeze", False)
-        _bb_ex = indicators.get("volatility", {}).get("bb_expanding", False)
-        _adx_v = indicators.get("trend", {}).get("adx", 0)
-        _adx_r = indicators.get("trend", {}).get("adx_rising", False)
-        _triple = best.get("triple_bull", False) if best else False
-        if _bb_sq and _bb_ex and _adx_v > 25 and _triple:
-            extended_tp = round(sl_pct * 7.0, 3)
-            if extended_tp > tp_pct:
-                logger.info(
-                    f"[{user_id}] TP étendu setup premium "
-                    f"BB-Squeeze+ADX{_adx_v:.0f}+TripleBull: {tp_pct}% → {extended_tp}%"
-                )
-                tp_pct = extended_tp
+        # ── 10. SL/TP V2 — fixe, calibré sur 1h RSI Recovery ─────────────────
+        sl_pct = SPOT_SL_PCT_V2  # 1.5%
+        tp_pct = SPOT_TP_PCT_V2  # 4.0%
+        logger.info(
+            f"[{user_id}] V2 RSI Recovery SL={sl_pct}% TP={tp_pct}% R:R={tp_pct/sl_pct:.1f}:1"
+        )
 
         # ── 11. Kelly position sizing avec réduction après pertes ────────────
         base_usdt    = (available_usdt / max_positions) * 0.90
@@ -665,12 +557,6 @@ class BotEngine:
         position_usdt = max(position_usdt, 5.50)
         position_usdt = min(position_usdt, available_usdt * 0.90)
 
-        # BEAR : position réduite — on scalpe des rebonds, on ne mise pas gros
-        if market_mode == "BEAR":
-            position_usdt *= 0.65
-            position_usdt = max(position_usdt, 5.50)
-            logger.info(f"[{user_id}] BEAR mode — position ×0.65 (rebond scalping)")
-
         # Multiplicateur qualité setup : BB Squeeze ou ADX fort → position plus grande
         bb_squeeze_now  = indicators.get("volatility", {}).get("bb_squeeze", False)
         bb_expanding_now = indicators.get("volatility", {}).get("bb_expanding", False)
@@ -679,75 +565,57 @@ class BotEngine:
         conf_now        = signal_data.get("confidence", 0)
 
         quality_label = ""
-        # Multiplicateurs qualité désactivés en BEAR — position déjà réduite à ×0.65
-        if market_mode != "BEAR":
-            if bb_squeeze_now and bb_expanding_now:
-                position_usdt = min(position_usdt * 1.25, available_usdt * 0.92)
-                quality_label = " [BB-SQUEEZE ×1.25]"
-            elif adx_now_val > 30 and adx_rising_now:
-                position_usdt = min(position_usdt * 1.15, available_usdt * 0.92)
-                quality_label = " [ADX-FORT ×1.15]"
-            elif conf_now >= 0.82:
-                position_usdt = min(position_usdt * 1.10, available_usdt * 0.92)
-                quality_label = " [CONF-HAUTE ×1.10]"
+        if bb_squeeze_now and bb_expanding_now:
+            position_usdt = min(position_usdt * 1.25, available_usdt * 0.92)
+            quality_label = " [BB-SQUEEZE ×1.25]"
+        elif adx_now_val > 30 and adx_rising_now:
+            position_usdt = min(position_usdt * 1.15, available_usdt * 0.92)
+            quality_label = " [ADX-FORT ×1.15]"
+        elif conf_now >= 0.82:
+            position_usdt = min(position_usdt * 1.10, available_usdt * 0.92)
+            quality_label = " [CONF-HAUTE ×1.10]"
 
         logger.info(
             f"[{user_id}] Position: {position_usdt:.2f} USDT "
             f"(WR={win_rate_pct:.0f}% kelly_mult={kelly_mult:.2f} consec_losses={consecutive}){quality_label}"
         )
 
-        # ── 12. Futures — évalué EN PREMIER, indépendamment de la position vs EMA9 ──
-        # Bug corrigé : Futures était dans le bloc else du pullback → jamais évalué en bull
-        adx_for_agg    = indicators.get("trend", {}).get("adx", 0)
-        triple_for_agg = best.get("triple_bull", False) if best else False
-        use_futures = self._is_aggressive_bull(
-            market_mode, signal_data.get("confidence", 0), adx_for_agg, triple_for_agg
+        # ── 12. Futures V2 — BTC 1h momentum ≥ +2% ET RSI 1h < 65 ─────────────
+        btc_1h_move, btc_rsi_1h = await self._get_btc_1h_stats()
+        use_futures = (
+            FUTURES_ENABLED
+            and _futures_ok
+            and btc_1h_move >= FUTURES_BTC_MOVE_MIN
+            and btc_rsi_1h < FUTURES_BTC_RSI_MAX
         )
         if use_futures:
+            logger.info(
+                f"[{user_id}] 🚀 Futures V2 trigger: BTC_1h_move={btc_1h_move:+.1f}% "
+                f"RSI_1h={btc_rsi_1h:.0f}"
+            )
             futures_ok = await self._execute_futures_long(
                 user_id, db, symbol, signal_data, current_price, indicators
             )
             if futures_ok:
                 bot_info["last_trade_at"]     = datetime.now(timezone.utc)
                 bot_info["daily_trade_count"] = bot_info.get("daily_trade_count", 0) + 1
-                logger.info(f"[{user_id}] Futures LONG execute — skip trade Spot")
+                logger.info(f"[{user_id}] Futures LONG V2 execute — skip trade Spot")
                 bot_info["cycles_count"] += 1
                 bot_info["last_cycle_at"] = datetime.now(timezone.utc)
-                return  # Futures pris → pas de trade Spot en plus
+                return
 
-        # ── 13. Spot — Pullback entry si prix très au-dessus EMA9 (>1.2%) ────
-        # Seuil relevé 0.3%→1.2% : évite de bloquer tous les trades en bull market
-        ema9 = indicators.get("trend", {}).get("ema_9", 0)
-        if ema9 > 0 and current_price > ema9 * 1.012 and market_mode not in ("RANGE", "BEAR"):
-            # Prix > EMA9 + 1.2% → attendre un pullback vers EMA9
-            bot_info["pending_entry"] = {
-                "symbol":        symbol,
-                "target_entry":  round(ema9, 8),
-                "signal_data":   signal_data,
-                "indicators":    indicators,
-                "sl_pct":        sl_pct,
-                "tp_pct":        tp_pct,
-                "config":        config,
-                "created_at":    datetime.now(timezone.utc),
-                "expires_at":    datetime.now(timezone.utc) + timedelta(minutes=15),
-            }
-            logger.info(
-                f"[{user_id}] Pullback pending {symbol}: "
-                f"prix={current_price:.4f} > EMA9+1.2%={ema9*1.012:.4f} — attente retour"
+        # ── 13. Spot V2 — entrée immédiate (signal 1h oversold, pas d'attente EMA9) ──
+        if available_usdt >= 5.5:
+            buy_ok = await self._execute_buy(
+                user_id, db, symbol, position_usdt, current_price,
+                sl_pct, tp_pct, signal_data, portfolio_data, config,
+                indicators=indicators,
             )
+            if buy_ok:
+                bot_info["last_trade_at"]     = datetime.now(timezone.utc)
+                bot_info["daily_trade_count"] = bot_info.get("daily_trade_count", 0) + 1
         else:
-            # Prix proche ou sous EMA9+1.2% → entrée Spot immédiate
-            if available_usdt >= 5.5:
-                buy_ok = await self._execute_buy(
-                    user_id, db, symbol, position_usdt, current_price,
-                    sl_pct, tp_pct, signal_data, portfolio_data, config,
-                    indicators=indicators,
-                )
-                if buy_ok:
-                    bot_info["last_trade_at"]     = datetime.now(timezone.utc)
-                    bot_info["daily_trade_count"] = bot_info.get("daily_trade_count", 0) + 1
-            else:
-                logger.info(f"[{user_id}] Spot insuffisant ({available_usdt:.2f}) — trade Spot ignore")
+            logger.info(f"[{user_id}] Spot insuffisant ({available_usdt:.2f}) — trade Spot ignore")
 
         bot_info["cycles_count"] += 1
         bot_info["last_cycle_at"] = datetime.now(timezone.utc)
@@ -856,6 +724,70 @@ class BotEngine:
             return False
         except Exception:
             return False
+
+    async def _check_btc_4h_macro(self) -> bool:
+        """Retourne True si BTC est au-dessus de la SMA50 4h — macro bullish."""
+        try:
+            key_4h = "klines:BTCUSDT:4h"
+            df4h = cache.get(key_4h)
+            if df4h is None:
+                df4h = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: binance_service.get_klines("BTCUSDT", "4h", limit=60)
+                )
+                cache.set(key_4h, df4h, ttl_seconds=KLINE_TTL.get("4h", 14400))
+
+            key_i4h = "indicators:BTCUSDT:4h"
+            ind4h = cache.get(key_i4h)
+            if ind4h is None:
+                ind4h = analysis_service.compute_indicators(df4h, symbol="BTCUSDT")
+                cache.set(key_i4h, ind4h, ttl_seconds=INDICATOR_TTL.get("4h", 14400))
+
+            candles4h = ind4h.get("candles_summary", [])
+            sma50_4h  = ind4h.get("trend", {}).get("sma_50", 0)
+            btc_close = candles4h[-1]["close"] if candles4h else 0
+
+            if btc_close <= 0 or sma50_4h <= 0:
+                return True  # données absentes → ne pas bloquer
+
+            above = btc_close > sma50_4h
+            logger.info(
+                f"BTC 4h macro: close={btc_close:.0f} SMA50={sma50_4h:.0f} "
+                f"→ {'BULL' if above else 'BEAR'}"
+            )
+            return above
+        except Exception as e:
+            logger.warning(f"BTC 4h macro check failed: {e}")
+            return True  # erreur → ne pas bloquer
+
+    async def _get_btc_1h_stats(self) -> Tuple[float, float]:
+        """Retourne (move_pct_1h, rsi_1h) pour BTC — trigger Futures V2."""
+        try:
+            key_1h = "klines:BTCUSDT:1h"
+            df1h = cache.get(key_1h)
+            if df1h is None:
+                df1h = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: binance_service.get_klines("BTCUSDT", "1h", limit=50)
+                )
+                cache.set(key_1h, df1h, ttl_seconds=KLINE_TTL.get("1h", 3600))
+
+            key_i1h = "indicators:BTCUSDT:1h"
+            ind1h = cache.get(key_i1h)
+            if ind1h is None:
+                ind1h = analysis_service.compute_indicators(df1h, symbol="BTCUSDT")
+                cache.set(key_i1h, ind1h, ttl_seconds=INDICATOR_TTL.get("1h", 3600))
+
+            candles = ind1h.get("candles_summary", [])
+            rsi_1h  = ind1h.get("momentum", {}).get("rsi", 50)
+            if len(candles) >= 2:
+                cur  = float(candles[-1]["close"])
+                prev = float(candles[-2]["close"])
+                move = (cur - prev) / prev * 100 if prev > 0 else 0.0
+            else:
+                move = 0.0
+            return move, rsi_1h
+        except Exception as e:
+            logger.warning(f"BTC 1h stats failed: {e}")
+            return 0.0, 50.0
 
     # ══════════════════════════════════════════════════════════════════════════
     # PULLBACK ENTRY — ENTRÉE SUR RETOUR EMA9
@@ -999,6 +931,149 @@ class BotEngine:
             except Exception as e:
                 logger.debug(f"Hot pairs fetch error: {e}")
         return cache.get("pairs", [])
+
+    async def _scan_1h_rsi_recovery(
+        self,
+        user_id: str,
+        open_symbols: set,
+        prices: Dict[str, float],
+        config: Dict[str, Any],
+        portfolio_data: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Stratégie V2 — 1h RSI Recovery:
+        Filtre les paires avec RSI 1h < 40 qui récupèrent (+3 pts en 3 bougies 1h).
+        Top 3 validés par Claude AI (seuil confiance 72%). Retourne le meilleur.
+        """
+        available = (portfolio_data or {}).get("available_usdt", 0.0)
+        now = datetime.now(timezone.utc)
+        sl_cooldown = self._running_bots.get(user_id, {}).get("sl_cooldown", {})
+
+        candidates_pool = [
+            s for s in SCAN_PAIRS
+            if s not in open_symbols
+            and s not in BANNED_PAIRS
+            and (s not in HIGH_NOTIONAL_PAIRS or available >= 15.0)
+            and (s not in sl_cooldown or now > sl_cooldown[s])
+        ]
+
+        if not candidates_pool:
+            return None
+
+        async def _fetch_1h(sym: str) -> Tuple[str, Optional[Dict]]:
+            try:
+                key_1h = f"klines:{sym}:1h"
+                df1h = cache.get(key_1h)
+                if df1h is None:
+                    df1h = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda s=sym: binance_service.get_klines(s, "1h", limit=100)
+                    )
+                    cache.set(key_1h, df1h, ttl_seconds=KLINE_TTL.get("1h", 3600))
+                ind_key = f"indicators:{sym}:1h"
+                ind = cache.get(ind_key)
+                if ind is None:
+                    ind = analysis_service.compute_indicators(df1h, symbol=sym)
+                    cache.set(ind_key, ind, ttl_seconds=INDICATOR_TTL.get("1h", 3600))
+                return sym, ind
+            except Exception as e:
+                logger.debug(f"[{user_id}] {sym} 1h fetch: {e}")
+                return sym, None
+
+        # Fetch toutes les paires en parallèle
+        pair_results = await asyncio.gather(*[_fetch_1h(s) for s in candidates_pool])
+
+        recovery_candidates = []
+        for sym, ind_1h in pair_results:
+            if ind_1h is None:
+                continue
+            mom      = ind_1h.get("momentum", {})
+            rsi_1h   = mom.get("rsi", 50)
+            rsi_3ago = mom.get("rsi_3ago", None)
+
+            if rsi_1h >= RSI_1H_OVERSOLD:
+                continue
+            # rsi_3ago absent = impossible de vérifier la recovery → skip (sécurité)
+            if rsi_3ago is None:
+                continue
+            recovery = rsi_1h - rsi_3ago
+            if recovery < RSI_1H_RECOVERY_MIN:
+                continue
+
+            score = (RSI_1H_OVERSOLD - rsi_1h) + recovery
+            logger.info(
+                f"[{user_id}] {sym}: RSI_1h={rsi_1h:.1f} rsi_3ago={rsi_3ago:.1f} "
+                f"recovery=+{recovery:.1f} score={score:.1f} ✓"
+            )
+            recovery_candidates.append({
+                "symbol":   sym,
+                "ind_1h":   ind_1h,
+                "rsi_1h":   rsi_1h,
+                "recovery": recovery,
+                "score":    score,
+            })
+
+        if not recovery_candidates:
+            logger.info(f"[{user_id}] Aucune paire en RSI Recovery 1h ce cycle")
+            return None
+
+        recovery_candidates.sort(key=lambda x: x["score"], reverse=True)
+        top3 = recovery_candidates[:3]
+        logger.info(
+            f"[{user_id}] Top {len(top3)} candidats RSI Recovery: "
+            + ", ".join(
+                f"{c['symbol']}(RSI={c['rsi_1h']:.0f},rec=+{c['recovery']:.1f})"
+                for c in top3
+            )
+        )
+
+        pf = portfolio_data or {}
+        for cand in top3:
+            sym    = cand["symbol"]
+            ind_1h = cand["ind_1h"]
+            price  = prices.get(sym, 0)
+            if price <= 0:
+                try:
+                    price = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda s=sym: binance_service.get_current_price(s)
+                    )
+                except Exception:
+                    continue
+
+            mtf_data = {"1h": "BUY", "context": "1h_rsi_recovery_oversold"}
+            try:
+                signal_data = await claude_service.analyze_market(
+                    sym, ind_1h, price, pf, mtf_data=mtf_data, market_mode="BULL"
+                )
+            except Exception as e:
+                logger.warning(f"[{user_id}] Claude failed {sym}: {e}")
+                continue
+
+            if signal_data.get("action") != "BUY":
+                logger.info(f"[{user_id}] {sym}: Claude={signal_data.get('action')} — skip")
+                continue
+            conf = signal_data.get("confidence", 0)
+            if conf < CLAUDE_MIN_CONF_V2:
+                logger.info(
+                    f"[{user_id}] {sym}: Claude conf={conf:.0%} < {CLAUDE_MIN_CONF_V2:.0%} — skip"
+                )
+                continue
+
+            logger.info(
+                f"[{user_id}] ✅ RSI Recovery validé: {sym} "
+                f"RSI_1h={cand['rsi_1h']:.0f} rec=+{cand['recovery']:.1f} conf={conf:.0%}"
+            )
+            return {
+                "symbol":          sym,
+                "signal":          signal_data,
+                "indicators":      ind_1h,
+                "composite_score": max(cand["score"], 6.5),
+                "triple_bull":     False,
+                "buy_the_dip":     True,
+                "rsi_1h":          cand["rsi_1h"],
+            }
+
+        logger.info(f"[{user_id}] Aucun candidat RSI Recovery validé par Claude ce cycle")
+        return None
 
     async def _scan_best_opportunity(
         self, user_id: str,
@@ -1794,8 +1869,8 @@ class BotEngine:
         indicators: Dict,
     ) -> bool:
         """
-        Ouvre un LONG Futures avec levier en Aggressive Bull Mode.
-        TP=5%, SL=1%, 10x levier, position 65% du capital Futures.
+        Ouvre un LONG Futures en mode BTC momentum V2.
+        TP=5%, SL=2%, 5x levier, position 65% du capital Futures.
         """
         try:
             # Une seule position Futures à la fois — évite le sur-levier
@@ -1818,24 +1893,24 @@ class BotEngine:
                 return False
 
             usable = max(futures_balance - FUTURES_BALANCE_RESERVE, 0)
-            # Position = 65% du capital Futures disponible
-            notional = usable * AGGRESSIVE_BULL_POSITION_PCT * FUTURES_LEVERAGE
+            # Position = 65% du capital Futures disponible × levier V2 (5x)
+            notional = usable * AGGRESSIVE_BULL_POSITION_PCT * FUTURES_LEVERAGE_V2
             if notional < 5.0:
                 logger.warning(f"[{user_id}] Futures notional trop faible: {notional:.2f} USDT")
                 return False
 
             tp_price = round(current_price * (1 + AGGRESSIVE_BULL_TP_PCT / 100), 8)
-            sl_price = round(current_price * (1 - AGGRESSIVE_BULL_SL_PCT / 100), 8)
+            sl_price = round(current_price * (1 - FUTURES_SL_PCT_V2 / 100), 8)
 
             logger.info(
-                f"[{user_id}] 🚀 AGGRESSIVE BULL FUTURES {symbol}: "
-                f"notional={notional:.2f} USDT levier={FUTURES_LEVERAGE}x "
-                f"TP={AGGRESSIVE_BULL_TP_PCT}% SL={AGGRESSIVE_BULL_SL_PCT}%"
+                f"[{user_id}] 🚀 FUTURES V2 {symbol}: "
+                f"notional={notional:.2f} USDT levier={FUTURES_LEVERAGE_V2}x "
+                f"TP={AGGRESSIVE_BULL_TP_PCT}% SL={FUTURES_SL_PCT_V2}%"
             )
 
             order = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: futures_service.open_long(symbol, notional, current_price, FUTURES_LEVERAGE)
+                lambda: futures_service.open_long(symbol, notional, current_price, FUTURES_LEVERAGE_V2)
             )
             if not order:
                 return False
@@ -1843,7 +1918,7 @@ class BotEngine:
             ex_price = order["price"]
             ex_qty   = order["qty"]
             tp_final = round(ex_price * (1 + AGGRESSIVE_BULL_TP_PCT / 100), 4)
-            sl_final = round(ex_price * (1 - AGGRESSIVE_BULL_SL_PCT / 100), 4)
+            sl_final = round(ex_price * (1 - FUTURES_SL_PCT_V2 / 100), 4)
 
             # Placer SL + TP sur Binance Futures (ordres serveur)
             await asyncio.get_event_loop().run_in_executor(
@@ -1852,7 +1927,7 @@ class BotEngine:
             )
 
             # Sauvegarder en MongoDB comme trade classique (tag futures=True)
-            margin_used = round(notional / FUTURES_LEVERAGE, 4)
+            margin_used = round(notional / FUTURES_LEVERAGE_V2, 4)
             now_utc = datetime.now(timezone.utc)
             doc = {
                 "user_id":        user_id,
@@ -1863,7 +1938,7 @@ class BotEngine:
                 "total_usdt":     margin_used,
                 "status":         "OPEN",
                 "futures":        True,
-                "leverage":       FUTURES_LEVERAGE,
+                "leverage":       FUTURES_LEVERAGE_V2,
                 "notional":       round(ex_qty * ex_price, 4),
                 "take_profit_price": tp_final,
                 "stop_loss_price":   sl_final,
@@ -1878,8 +1953,8 @@ class BotEngine:
 
             gain_potentiel = round(ex_qty * ex_price * AGGRESSIVE_BULL_TP_PCT / 100, 2)
             logger.info(
-                f"[{user_id}] ✅ Futures LONG ouvert {symbol} @ {ex_price:.4f} "
-                f"levier={FUTURES_LEVERAGE}x marge={margin_used:.2f} USDT "
+                f"[{user_id}] ✅ Futures V2 LONG ouvert {symbol} @ {ex_price:.4f} "
+                f"levier={FUTURES_LEVERAGE_V2}x marge={margin_used:.2f} USDT "
                 f"gain potentiel=+${gain_potentiel}"
             )
             return True
@@ -1913,7 +1988,7 @@ class BotEngine:
             entry     = float(trade.get("price", 0))
             notional  = float(trade.get("notional", 0))
             margin    = float(trade.get("total_usdt", 0))
-            leverage  = int(trade.get("leverage", FUTURES_LEVERAGE))
+            leverage  = int(trade.get("leverage", FUTURES_LEVERAGE_V2))
             tp_stored = float(trade.get("take_profit_price", 0))
             sl_stored = float(trade.get("stop_loss_price", 0))
 
