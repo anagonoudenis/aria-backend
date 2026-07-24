@@ -92,7 +92,7 @@ MIN_VOLUME_RATIO    = MIN_VOLUME_RATIO_BULL
 MAX_CONSECUTIVE_LOSSES   = 2        # circuit breaker après 2 pertes (était 3)
 SL_COOLDOWN_SECONDS      = 90 * 60  # 90 min cooldown après SL (était 45 min)
 MIN_TRADE_INTERVAL_SECS  = 20 * 60  # 20 min entre trades — qualité > quantité
-DAILY_MAX_LOSS_PCT        = 1.0     # stoppe à -1% jour (était 1.2%)
+DAILY_MAX_LOSS_PCT        = 3.0     # stoppe à -3% jour — SL V2=1.5% → 2 pertes max avant blocage
 MAX_DAILY_TRADES          = 6       # max 6 trades/jour — moins c'est plus (était 18)
 DAILY_PROFIT_LOCK_PCT     = 5.0     # verrouille les gains si +5% du capital en une journée (était 2%)
 
