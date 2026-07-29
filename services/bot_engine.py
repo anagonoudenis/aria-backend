@@ -109,16 +109,16 @@ AGGRESSIVE_BULL_POSITION_PCT = 0.65 # 65% du capital Futures engagé
 AGGRESSIVE_BULL_TP_PCT       = 5.0  # TP 5% — ride le trend
 AGGRESSIVE_BULL_SL_PCT       = 1.0  # SL 1% — coupe vite si ça retourne
 
-# ── STRATÉGIE V2 — 1h RSI Recovery ─────────────────────────────────────────
-RSI_1H_OVERSOLD       = 40    # RSI 1h < 40 = zone oversold, candidat à rebond
-RSI_1H_RECOVERY_MIN   = 3.0   # récupération minimale RSI sur 3 bougies 1h
-SPOT_SL_PCT_V2        = 1.5   # SL Spot V2 — plus large pour tenir les rebonds 1h
+# ── STRATÉGIE V2 — 1h RSI Dip & Recovery ───────────────────────────────────
+RSI_1H_OVERSOLD       = 52    # RSI 1h < 52 — dip en marché BULL (était 40, trop restrictif)
+RSI_1H_RECOVERY_MIN   = 1.5   # récupération minimale RSI sur 3 bougies 1h (était 3.0)
+SPOT_SL_PCT_V2        = 1.5   # SL Spot V2
 SPOT_TP_PCT_V2        = 4.0   # TP Spot V2 — R:R 2.67:1
 FUTURES_BTC_MOVE_MIN  = 2.0   # BTC 1h move ≥ +2% pour trigger Futures V2
 FUTURES_BTC_RSI_MAX   = 65    # BTC RSI 1h < 65 — pas surchauffé
-FUTURES_LEVERAGE_V2   = 5     # 5x levier — plus prudent que 10x
-FUTURES_SL_PCT_V2     = 2.0   # SL Futures V2 — 2% (était 1%)
-CLAUDE_MIN_CONF_V2    = 0.72  # confiance Claude minimale pour valider un signal V2
+FUTURES_LEVERAGE_V2   = 5     # 5x levier
+FUTURES_SL_PCT_V2     = 2.0   # SL Futures V2
+CLAUDE_MIN_CONF_V2    = 0.70  # confiance Claude minimale (était 0.72)
 
 _active_cycles: set = set()
 
@@ -749,10 +749,10 @@ class BotEngine:
             if btc_close <= 0 or sma50_4h <= 0:
                 return True  # données absentes → ne pas bloquer
 
-            above = btc_close > sma50_4h
+            above = btc_close > sma50_4h * 0.98  # tolérance 2% sous SMA50
             logger.info(
                 f"BTC 4h macro: close={btc_close:.0f} SMA50={sma50_4h:.0f} "
-                f"→ {'BULL' if above else 'BEAR'}"
+                f"gap={((btc_close/sma50_4h)-1)*100:.2f}% → {'BULL' if above else 'BEAR'}"
             )
             return above
         except Exception as e:
